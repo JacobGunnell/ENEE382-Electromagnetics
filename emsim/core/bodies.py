@@ -133,6 +133,9 @@ class Body:
     #: windings -- so averaged *vertex* normals cancel to zero and come out
     #: NaN.  They must be shaded from face normals instead.
     smooth_shading: bool = True
+    #: A zero-thickness body carries charge on both faces, so field lines
+    #: must be seeded off either side of it.
+    two_sided: bool = False
     #: True when the interior is a meaningful place for charge to sit, i.e.
     #: when "migrates to the surface" is a visible statement about the body.
     has_interior: bool = False
@@ -169,6 +172,22 @@ class Body:
     def _local(self, points: np.ndarray) -> np.ndarray:
         u, v, w = self.frame()
         return (np.atleast_2d(points) - self.position) @ np.stack([u, v, w]).T
+
+    def seed_normals(self, pos: np.ndarray) -> np.ndarray:
+        """Direction to step a field-line seed clear of the surface.
+
+        The default -- radially outward from the centroid -- is right for a
+        sphere.  Flat and wire-like bodies override it, because "away from the
+        centre" does not leave their surface.
+        """
+        d = np.atleast_2d(pos) - self.position
+        n = np.linalg.norm(d, axis=1, keepdims=True)
+        return np.divide(d, n, out=np.tile([0.0, 0.0, 1.0], (len(d), 1)),
+                         where=n > 0)
+
+    def _swirl(self, count: int) -> np.ndarray:
+        """Golden-angle sequence, so successive seeds spray around a wire."""
+        return GOLDEN_ANGLE * np.arange(count)
 
     def mesh(self) -> tuple[np.ndarray, np.ndarray]:
         """``(verts, faces)`` for rendering."""
@@ -231,6 +250,11 @@ class Line(Body):
         t, dist = _ray_segment(origin, direction, a, b)
         return t if dist <= self.wire_radius * 2.5 else None
 
+    def seed_normals(self, pos):
+        u, v, w = self.frame()
+        psi = self._swirl(len(np.atleast_2d(pos)))
+        return np.outer(np.cos(psi), u) + np.outer(np.sin(psi), v)
+
     def contains(self, points, pad=0.0):
         d = self._local(points)
         z = np.clip(d[:, 2], -self.length / 2, self.length / 2)
@@ -280,6 +304,14 @@ class Loop(Body):
                 best = t
         return best
 
+    def seed_normals(self, pos):
+        u, v, w = self.frame()
+        d = self._local(pos)
+        phi = np.arctan2(d[:, 1], d[:, 0])
+        r_hat = np.outer(np.cos(phi), u) + np.outer(np.sin(phi), v)
+        psi = self._swirl(len(d))
+        return r_hat * np.cos(psi)[:, None] + w[None, :] * np.sin(psi)[:, None]
+
     def contains(self, points, pad=0.0):
         d = self._local(points)
         radial = np.hypot(d[:, 0], d[:, 1]) - self.radius
@@ -296,6 +328,7 @@ class Sheet(Body):
     width: float = 0.8
     height: float = 0.8
     kind: str = "sheet"
+    two_sided: bool = True
     params: tuple = (("width", "Width"), ("height", "Height"))
     smooth_shading: bool = False
 
@@ -327,6 +360,9 @@ class Sheet(Body):
             return t
         return None
 
+    def seed_normals(self, pos):
+        return np.tile(self.axis, (len(np.atleast_2d(pos)), 1))
+
     def contains(self, points, pad=0.0):
         d = self._local(points)
         return ((np.abs(d[:, 2]) <= pad)
@@ -350,6 +386,7 @@ class Disk(Body):
 
     radius: float = 0.45
     kind: str = "disk"
+    two_sided: bool = True
     params: tuple = (("radius", "Radius"),)
     smooth_shading: bool = False
 
@@ -372,6 +409,9 @@ class Disk(Body):
             return None
         d = origin + t * direction - self.position
         return t if np.linalg.norm(d) <= self.radius else None
+
+    def seed_normals(self, pos):
+        return np.tile(self.axis, (len(np.atleast_2d(pos)), 1))
 
     def contains(self, points, pad=0.0):
         d = self._local(points)

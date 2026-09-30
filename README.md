@@ -12,7 +12,7 @@ Built on PyQt6 + pyqtgraph's OpenGL viewport, in a `uv`-managed venv.
 
 ```sh
 uv run main.py          # or: uv run emsim
-uv run pytest           # 120 tests, no display required
+uv run pytest           # 137 tests, no display required
 ```
 
 `uv sync` provisions Python 3.13 and the dependencies on first run.
@@ -98,11 +98,34 @@ Arrow length is capped at 8 × the half-width, far outside the visible box, so
 it never truncates a force you are looking at — it only stops near-coincident
 charges from generating absurd geometry.
 
-**Electric field** — a fixed-length arrow at every point of an *n*³ grid,
-coloured by |**E**| against a colorbar. Length is deliberately constant so that
-colour is the only magnitude channel; a log scale is the default because a
-Coulomb field spans decades across any interesting region. Samples that land
-inside a charge are dropped rather than drawn.
+**Electric field** — drawn as either **arrows** or **field lines**, switched
+with the *Style* control. Both use the same normalisation and the same
+colormap, so the colorbar means the same thing either way and switching style
+never changes what a given colour stands for.
+
+*Arrows* puts a fixed-length glyph at every point of an *n*³ grid, coloured by
+|**E**|. Length is deliberately constant so that colour is the only magnitude
+channel; a log scale is the default because a Coulomb field spans decades
+across any interesting region. Samples landing inside a charge or a body are
+dropped rather than drawn.
+
+*Field lines* traces streamlines of **E**, colouring each segment by the local
+|**E**| — so a single line goes from yellow where it leaves a charge to purple
+far away. Small chevrons along each line show which way the field points,
+which a bare line otherwise leaves ambiguous.
+
+Seeding is what makes a field-line picture mean anything, so lines are
+allocated **in proportion to charge**: double the charge, double the lines, in
+line with the usual convention. Within a body the seeds are drawn in proportion
+to the *local* surface charge, so the pile-up at a plate's rim shows up as a
+visible crowding of lines. A body is weighted by the total charge *magnitude*
+on it rather than its net, so a neutral conductor carrying induced charge still
+grows lines. *Line density* sets the overall budget.
+
+Lines stop when they reach a charge, reach a body, or leave the region — and
+the last point is pulled back onto the boundary so a line ends on the wall of
+the box rather than poking through it. A line that ends up circling a null
+point without terminating is dropped.
 
 Shading is baked into the vertex colours with a clamped ambient term rather
 than left to the GL `shaded` shader. Full Lambertian shading swings a face's
@@ -225,6 +248,7 @@ emsim/
     colormaps.py    self-contained LUTs
     norms.py        Linear / Log / SymLog, each generating its own ticks
     geometry.py     vectorised arrow-mesh construction
+    fieldlines.py   streamline seeding and tracing
     layers.py       Charge / Cloud / Force / EField / Body / Measure /
                     Potential layers + LayerStack
     view3d.py       picking, dragging, camera maths
@@ -275,6 +299,15 @@ Rebuilding force + a 9³ field + a 40³ potential volume takes ~15 ms; during a
 drag, resolution drops to 60 % and it takes ~4 ms. Redraws are coalesced on a
 16 ms timer. A 64³ volume costs ~135 ms, which is why the drag-quality reduction
 exists.
+
+Field lines cost more than glyphs: tracing is roughly one field evaluation per
+line per integration step. With two 320-site plates, 110 lines take ~79 ms.
+Step length is adapted to hold a fixed turn per step, so a line takes long
+strides where it runs straight and short ones where it bends, which is worth
+about 3.5x over a fixed step. During a drag the line budget is cut by the
+*square* of the quality factor — shedding lines is the only thing that makes
+this style fluid — bringing it to ~35 ms. The glyph style stays the one to drag
+with.
 
 With two 320-site conductors plus the field and force layers, a redraw is ~26 ms
 as long as the conductor geometry has not changed, because the factorisation is

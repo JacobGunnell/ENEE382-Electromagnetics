@@ -18,6 +18,7 @@ from ..core.bodies import Material
 from ..core.entities import REFERENCE_CHARGE
 from ..units import K_COULOMB, Quantity, UnitSystem
 from . import colormaps as cmaps
+from . import fieldlines
 from .geometry import arrow_soup, shade_mesh
 from .overlay import Label3D, LabelSet
 from .norms import LinearNorm, LogNorm, SymLogNorm, robust_range
@@ -98,6 +99,8 @@ class RenderSettings:
     force_labels: bool = True
 
     show_efield: bool = False
+    field_style: str = "arrows"        # "arrows" | "lines"
+    line_density: int = 110
     field_grid: int = 9
     field_log: bool = True
     field_cmap: str = "viridis"
@@ -122,6 +125,12 @@ class RenderSettings:
 
     def eff_field_grid(self) -> int:
         return max(3, int(round(self.field_grid * self.quality)))
+
+    def eff_line_density(self) -> int:
+        # Squared, unlike the other quality knobs: tracing costs roughly one
+        # field evaluation per line per step, so shedding lines is the only
+        # thing that makes a drag fluid in this style.
+        return max(8, int(round(self.line_density * self.quality**2)))
 
     def eff_pot_res(self) -> int:
         return max(8, int(round(self.pot_res * self.quality)))
@@ -243,12 +252,44 @@ class ForceLayer(Layer):
 
 # --------------------------------------------------------------------------
 class EFieldLayer(Layer):
-    """Fixed-length arrows on a 3-D grid, coloured by |E|."""
+    """The electric field, as either a grid of glyphs or traced field lines.
+
+    Both styles use the same normalisation and the same colormap, so the
+    colorbar means the same thing either way and switching style does not
+    change what a given colour stands for.
+    """
+
+    LINE_WIDTH = 1.9
+    #: Direction heads are deliberately short and wide -- the line itself is
+    #: already the shaft, so what is wanted is a chevron, not an arrow.
+    HEAD_LEN, HEAD_WIDTH = 0.05, 0.10
 
     def rebuild(self, scene, st: RenderSettings) -> None:
-        state = scene.state()
-        if not len(state.q):
+        if not len(scene.state().q):
             return
+        if st.field_style == "lines":
+            self._rebuild_lines(scene, st)
+        else:
+            self._rebuild_arrows(scene, st)
+
+    # -- shared ------------------------------------------------------------
+    @staticmethod
+    def _norm_for(mag: np.ndarray, st: RenderSettings):
+        lo, hi = robust_range(mag, 8.0, 98.0)
+        if st.field_log:
+            hi = max(hi, 1e-300)
+            # Three decades keeps the weak-field parts off the very dark end
+            # of the colormap, where they vanish against the background.
+            return LogNorm(max(lo, hi * 1e-3), hi)
+        return LinearNorm(0.0, max(hi, 1e-300))
+
+    def _publish(self, norm, st: RenderSettings) -> None:
+        self.scale = ColorScale(norm, st.field_cmap,
+                                f"|E|  ({st.units.unit_symbol(Quantity.EFIELD)})",
+                                Quantity.EFIELD)
+
+    # -- glyph grid --------------------------------------------------------
+    def _rebuild_arrows(self, scene, st: RenderSettings) -> None:
         n = st.eff_field_grid()
         axis = np.linspace(-st.domain, st.domain, n)
         gx, gy, gz = np.meshgrid(axis, axis, axis, indexing="ij")
@@ -257,16 +298,8 @@ class EFieldLayer(Layer):
         # Drop samples buried inside a charge or a body, where the arrow
         # would be hidden and the magnitude is dominated by the regularisation
         # rather than by anything physical.
-        keep = np.ones(len(pts), dtype=bool)
-        if scene.charges:
-            pos = scene.positions()
-            rad = np.array([c.radius for c in scene.charges])
-            d = np.linalg.norm(pts[:, None, :] - pos[None, :, :], axis=2)
-            keep &= (d > 1.3 * rad[None, :]).all(axis=1)
         spacing = (2.0 * st.domain) / max(n - 1, 1)
-        for b in scene.bodies:
-            keep &= ~b.contains(pts, pad=0.35 * spacing)
-        pts = pts[keep]
+        pts = pts[self._outside(scene, pts, 0.35 * spacing)]
         if len(pts) == 0:
             return
 
@@ -277,18 +310,9 @@ class EFieldLayer(Layer):
         if len(pts) == 0:
             return
 
-        lo, hi = robust_range(mag, 8.0, 98.0)
-        if st.field_log:
-            hi = max(hi, 1e-300)
-            # Three decades keeps the weak-field glyphs off the very dark end
-            # of the colormap, where they vanish against the background.
-            norm = LogNorm(max(lo, hi * 1e-3), hi)
-        else:
-            norm = LinearNorm(0.0, max(hi, 1e-300))
-
-        t = np.asarray(norm(mag), dtype=float)
-        colors = cmaps.map_rgba_float(st.field_cmap, t, 1.0)
-
+        norm = self._norm_for(mag, st)
+        colors = cmaps.map_rgba_float(st.field_cmap,
+                                      np.asarray(norm(mag), dtype=float), 1.0)
         length = st.field_len_frac * spacing
         dirs = E / mag[:, None]
         # Centre each glyph on its grid point rather than starting there.
@@ -299,10 +323,55 @@ class EFieldLayer(Layer):
                                 ambient=0.72)
         self._add(gl.GLMeshItem(vertexes=tris, vertexColors=cols, smooth=False,
                                 shader=None, glOptions="opaque"))
+        self._publish(norm, st)
 
-        self.scale = ColorScale(norm, st.field_cmap,
-                                f"|E|  ({st.units.unit_symbol(Quantity.EFIELD)})",
-                                Quantity.EFIELD)
+    @staticmethod
+    def _outside(scene, pts: np.ndarray, pad: float) -> np.ndarray:
+        keep = np.ones(len(pts), dtype=bool)
+        if scene.charges:
+            pos = scene.positions()
+            rad = np.array([c.radius for c in scene.charges])
+            d = np.linalg.norm(pts[:, None, :] - pos[None, :, :], axis=2)
+            keep &= (d > 1.3 * rad[None, :]).all(axis=1)
+        for b in scene.bodies:
+            keep &= ~b.contains(pts, pad=pad)
+        return keep
+
+    # -- traced field lines ------------------------------------------------
+    def _rebuild_lines(self, scene, st: RenderSettings) -> None:
+        seeds, signs = fieldlines.collect_seeds(
+            scene, st.eff_line_density(), st.domain)
+        if not len(seeds):
+            return
+        paths, strengths, kept = fieldlines.trace(
+            scene, seeds, signs, domain=st.domain, step=st.domain / 60.0)
+        verts, mag = fieldlines.segments(paths, strengths)
+        if not len(verts):
+            return
+
+        norm = self._norm_for(mag, st)
+        colors = cmaps.map_rgba_float(st.field_cmap,
+                                      np.asarray(norm(mag), dtype=float), 1.0)
+        item = gl.GLLinePlotItem(pos=verts, color=colors.astype(np.float32),
+                                 mode="lines", width=self.LINE_WIDTH,
+                                 antialias=True, glOptions="translucent")
+        item.setDepthValue(0)
+        self._add(item)
+
+        # Heads along each line: without them a line does not say which way
+        # the field points.
+        hp, ht, hm = fieldlines.direction_markers(paths, strengths, kept)
+        if len(hp):
+            ln = np.full(len(hp), self.HEAD_LEN * st.domain)
+            wd = np.full(len(hp), self.HEAD_WIDTH * st.domain)
+            hc = cmaps.map_rgba_float(st.field_cmap,
+                                      np.asarray(norm(hm), dtype=float), 1.0)
+            tris, cols = arrow_soup(hp - ht * (0.5 * ln)[:, None], ht, ln,
+                                    wd, hc, n_sides=8, ambient=0.72)
+            self._add(gl.GLMeshItem(vertexes=tris, vertexColors=cols,
+                                    smooth=False, shader=None,
+                                    glOptions="opaque"))
+        self._publish(norm, st)
 
 
 # --------------------------------------------------------------------------

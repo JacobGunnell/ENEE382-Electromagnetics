@@ -313,29 +313,58 @@ class ControlPanel(QtWidgets.QWidget):
         self.cb_efield.toggled.connect(self._on_toggle)
         lay.addWidget(self.cb_efield)
 
+        self.field_style = QtWidgets.QComboBox()
+        self.field_style.addItems(["Arrows", "Field lines"])
+        self.field_style.setCurrentIndex(0 if self.st.field_style == "arrows"
+                                         else 1)
+        self.field_style.setToolTip(
+            "Arrows: fixed-length glyphs on a grid.\n"
+            "Field lines: traced from the charge itself, so where lines start "
+            "and how densely they crowd both carry meaning.")
+        self.field_style.currentIndexChanged.connect(self._on_toggle)
+        self.field_rows_common = [_row("Style", self.field_style)]
+
+        self.line_density = _slider(20, 400, self.st.line_density)
+        self.line_density.valueChanged.connect(self._on_toggle)
+        self.line_density_label = QtWidgets.QLabel()
+        self.line_density_label.setMinimumWidth(30)
+        holder = QtWidgets.QWidget()
+        hl = QtWidgets.QHBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(4)
+        hl.addWidget(self.line_density, 1)
+        hl.addWidget(self.line_density_label)
+        self.line_rows = [_row("Line density", holder)]
+
         self.field_grid = QtWidgets.QSpinBox()
         self.field_grid.setRange(3, 21)
         self.field_grid.setValue(self.st.field_grid)
         self.field_grid.valueChanged.connect(self._on_toggle)
-        self.field_rows = [_row("Grid n³", self.field_grid)]
+        self.arrow_rows = [_row("Grid n³", self.field_grid)]
 
         self.field_len = _slider(20, 100, int(self.st.field_len_frac * 100))
         self.field_len.valueChanged.connect(self._on_toggle)
-        self.field_rows.append(_row("Glyph size", self.field_len))
+        self.arrow_rows.append(_row("Glyph size", self.field_len))
 
         self.cb_field_log = QtWidgets.QCheckBox("Log colour scale")
         self.cb_field_log.setChecked(self.st.field_log)
         self.cb_field_log.toggled.connect(self._on_toggle)
-        self.field_rows.append(_row("", self.cb_field_log))
+        self.field_rows_common.append(_row("", self.cb_field_log))
 
         self.field_cmap = QtWidgets.QComboBox()
         self.field_cmap.addItems(list(cmaps.SEQUENTIAL))
         self.field_cmap.setCurrentText(self.st.field_cmap)
         self.field_cmap.currentTextChanged.connect(self._on_toggle)
-        self.field_rows.append(_row("Colormap", self.field_cmap))
+        self.field_rows_common.append(_row("Colormap", self.field_cmap))
 
-        for r in self.field_rows:
+        # Style first, then whichever set of options applies to it.
+        lay.addWidget(self.field_rows_common[0])
+        for r in self.arrow_rows + self.line_rows:
             lay.addWidget(r)
+        for r in self.field_rows_common[1:]:
+            lay.addWidget(r)
+        self.field_rows = (self.field_rows_common + self.arrow_rows
+                           + self.line_rows)
         self.v.addWidget(box)
 
     def _build_potential(self) -> None:
@@ -464,6 +493,9 @@ class ControlPanel(QtWidgets.QWidget):
         st.force_labels = self.cb_force_lbl.isChecked()
 
         st.show_efield = self.cb_efield.isChecked()
+        st.field_style = ("arrows" if self.field_style.currentIndex() == 0
+                          else "lines")
+        st.line_density = self.line_density.value()
         st.field_grid = self.field_grid.value()
         st.field_len_frac = self.field_len.value() / 100.0
         st.field_log = self.cb_field_log.isChecked()
@@ -488,8 +520,14 @@ class ControlPanel(QtWidgets.QWidget):
         for w in (self.force_row, self.force_lbl_row):
             w.setEnabled(on)
         on = self.cb_efield.isChecked()
+        lines = self.field_style.currentIndex() == 1
         for w in self.field_rows:
             w.setEnabled(on)
+        for w in self.arrow_rows:
+            w.setVisible(not lines)
+        for w in self.line_rows:
+            w.setVisible(lines)
+        self.line_density_label.setText(str(self.line_density.value()))
         on = self.cb_pot.isChecked()
         for w in self.pot_rows:
             w.setEnabled(on)
