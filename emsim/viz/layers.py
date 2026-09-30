@@ -66,6 +66,26 @@ def force_arrow_length(magnitude, domain: float, gain: float = 1.0):
     return np.minimum(length, FORCE_MAX_LENGTH * domain)
 
 
+def force_anchor_offset(target, direction: np.ndarray, scene) -> float:
+    """How far to push a force arrow off a target's centre, along ``direction``.
+
+    This is the target's own extent in that direction, so the arrow starts at
+    the surface it is pulling on rather than inside the body.  It has to be
+    measured along the force, not taken from whatever attribute happens to be
+    called ``radius``: a disc's ``radius`` is its size *across* the plate, and
+    using it for a force along the plate normal pushes the arrow a whole plate
+    radius away -- far enough, for a capacitor, to land past the other plate
+    and make attraction look exactly like repulsion.
+    """
+    if not hasattr(target, "material"):          # a point charge: a ball
+        return float(getattr(target, "radius", 0.0))
+    sites = scene.state().body_sites.get(target.uid)
+    if sites is None or not len(sites[0]):
+        return 0.0
+    reach = (sites[0] - target.position) @ np.asarray(direction, dtype=float)
+    return max(float(reach.max()), 0.0)
+
+
 def force_gain_for(magnitude, gain_limits=(1e-6, 1e6)) -> float:
     """Gain that would draw a force of ``magnitude`` at the reference length.
 
@@ -225,14 +245,15 @@ class ForceLayer(Layer):
         if not keep.any():
             return
 
-        origins = np.array([t.position for t in targets])[keep]
-        radii = np.array([getattr(t, "radius", None) or t.size()
-                          for t in targets])[keep]
+        live = [t for t, k in zip(targets, keep) if k]
+        origins = np.array([t.position for t in live])
         dirs = F[keep] / mag[keep][:, None]
         L = lengths[keep]
 
-        # Start the arrow at the sphere surface, not its centre.
-        origins = origins + dirs * radii[:, None]
+        # Start each arrow at the surface it acts on, not at the centre.
+        offsets = np.array([force_anchor_offset(t, d, scene)
+                            for t, d in zip(live, dirs)])
+        origins = origins + dirs * offsets[:, None]
         colors = np.tile(np.array(FORCE_RGBA, dtype=np.float32), (len(L), 1))
         tris, cols = arrow_soup(origins, dirs, L, 0.30 * L, colors,
                                 ambient=0.55)

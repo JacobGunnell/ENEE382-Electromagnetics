@@ -217,11 +217,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.request_redraw()
 
     def fit_force_scale(self) -> None:
-        """One-shot recalibration of the (otherwise fixed) force arrow scale."""
-        F = self.scene.forces()
-        if len(F) == 0:
+        """One-shot recalibration of the (otherwise fixed) force arrow scale.
+
+        Covers bodies as well as point charges -- a scene of two capacitor
+        plates has no point charges at all, and Fit did nothing in it.
+        """
+        mags = list(np.linalg.norm(self.scene.forces(), axis=1))
+        mags += [float(np.linalg.norm(v))
+                 for v in self.scene.body_forces().values()]
+        if not mags:
             return
-        self.panel.fit_force_gain(np.linalg.norm(F, axis=1))
+        self.panel.fit_force_gain(np.array(mags))
 
     def reset_view(self) -> None:
         d = self.settings.domain

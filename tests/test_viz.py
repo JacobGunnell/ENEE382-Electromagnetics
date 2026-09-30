@@ -258,3 +258,92 @@ def test_fit_gain_handles_a_scene_with_no_force():
     from emsim.viz.layers import force_gain_for
     assert force_gain_for(np.array([])) == 1.0
     assert force_gain_for(np.zeros(3)) == 1.0
+
+
+# -- where a force arrow is anchored ---------------------------------------
+def _plates(qa, qb, gap=0.36, radius=0.45):
+    from emsim.core import Disk, Scene
+    s = Scene()
+    a = s.add_body(Disk(radius=radius, position=[0, 0, -gap / 2],
+                        axis=[0, 0, 1], n_sites=300))
+    b = s.add_body(Disk(radius=radius, position=[0, 0, gap / 2],
+                        axis=[0, 0, 1], n_sites=300))
+    a.charge, b.charge = qa, qb
+    return s, a, b
+
+
+def _arrow(scene, body):
+    """The segment actually drawn for the net force on ``body``."""
+    from emsim.viz.layers import force_anchor_offset, force_arrow_length
+    F = scene.body_forces()[body.uid]
+    mag = np.linalg.norm(F)
+    d = F / mag
+    start = body.position + d * force_anchor_offset(body, d, scene)
+    return start, start + d * force_arrow_length(mag, 1.0, 1.0)
+
+
+def test_force_anchor_is_measured_along_the_force_not_across_the_body():
+    """A disc's `radius` is its size *across* the plate.
+
+    Using it as an along-the-force offset pushed a capacitor plate's arrow a
+    whole plate radius away -- past the other plate -- which made attraction
+    render exactly like repulsion.
+    """
+    from emsim.core import Scene, Sphere
+    from emsim.viz.layers import force_anchor_offset
+
+    s, a, _ = _plates(4e-9, -4e-9)
+    normal, in_plane = np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 0.0])
+    assert force_anchor_offset(a, normal, s) == pytest.approx(0.0, abs=1e-9)
+    # A few percent short of the true radius: the extent is measured from the
+    # discrete sites, and the outermost ones do not land exactly on +x.
+    assert force_anchor_offset(a, in_plane, s) == pytest.approx(0.45, rel=0.05)
+
+    s2 = Scene()
+    ball = s2.add_body(Sphere(radius=0.3, n_sites=200))
+    ball.charge = 5e-9
+    assert force_anchor_offset(ball, normal, s2) == pytest.approx(0.3, rel=0.02)
+
+
+def test_attracting_plates_draw_arrows_pointing_at_each_other():
+    s, a, b = _plates(4e-9, -4e-9)
+    for body, other in ((a, b), (b, a)):
+        start, tip = _arrow(s, body)
+        near = np.linalg.norm(tip - other.position)
+        far = np.linalg.norm(start - other.position)
+        assert near < far                      # the arrow closes the gap
+        # and it starts on the plate, not somewhere past the other one
+        assert start[2] == pytest.approx(body.position[2], abs=1e-9)
+        assert abs(tip[2]) < abs(body.position[2]) + 1e-9
+
+
+def test_repelling_plates_draw_arrows_pointing_apart():
+    s, a, b = _plates(4e-9, 4e-9)
+    for body, other in ((a, b), (b, a)):
+        start, tip = _arrow(s, body)
+        assert np.linalg.norm(tip - other.position) > \
+            np.linalg.norm(start - other.position)
+        assert abs(tip[2]) > abs(body.position[2])
+
+
+def test_inverting_one_plate_reverses_both_drawn_arrows():
+    """The symptom that gave the bug away: flipping a sign changed nothing."""
+    s_att, a_att, b_att = _plates(4e-9, -4e-9)
+    s_rep, a_rep, b_rep = _plates(4e-9, 4e-9)
+    for body_att, body_rep in ((a_att, a_rep), (b_att, b_rep)):
+        start, tip = _arrow(s_att, body_att)
+        start2, tip2 = _arrow(s_rep, body_rep)
+        assert np.sign((tip - start)[2]) == -np.sign((tip2 - start2)[2])
+
+
+def test_point_charge_arrows_still_start_at_the_ball_surface():
+    from emsim.core import PointCharge, Scene
+    from emsim.core.entities import radius_for_charge
+    from emsim.viz.layers import force_anchor_offset
+
+    s = Scene()
+    c = s.add_charge(PointCharge(q=10e-9, position=[-0.35, 0, 0],
+                                 radius=radius_for_charge(10e-9)))
+    s.add_charge(PointCharge(q=-10e-9, position=[0.35, 0, 0]))
+    d = np.array([1.0, 0.0, 0.0])
+    assert force_anchor_offset(c, d, s) == pytest.approx(c.radius)
