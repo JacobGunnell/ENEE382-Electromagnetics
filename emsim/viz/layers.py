@@ -14,10 +14,11 @@ from dataclasses import dataclass
 import numpy as np
 import pyqtgraph.opengl as gl
 
+from ..core.bodies import Material
 from ..core.entities import REFERENCE_CHARGE
 from ..units import K_COULOMB, Quantity, UnitSystem
 from . import colormaps as cmaps
-from .geometry import arrow_soup
+from .geometry import arrow_soup, shade_mesh
 from .overlay import Label3D, LabelSet
 from .norms import LinearNorm, LogNorm, SymLogNorm, robust_range
 
@@ -25,6 +26,14 @@ POSITIVE_RGBA = (0.95, 0.35, 0.30, 1.0)
 NEGATIVE_RGBA = (0.30, 0.55, 0.98, 1.0)
 NEUTRAL_RGBA = (0.75, 0.75, 0.78, 1.0)
 FORCE_RGBA = (1.0, 0.86, 0.25, 1.0)
+
+CONDUCTOR_RGB = (0.66, 0.71, 0.79)          # brushed metal
+INSULATOR_RGB = (0.56, 0.42, 0.78)          # violet
+#: A body is drawn nearly solid until the cursor is over it, then it drops to
+#: a glassy alpha so you can see the charge sitting inside.
+BODY_ALPHA = 0.80
+BODY_ALPHA_HOVER = 0.15
+BODY_ALPHA_SELECTED = 0.42
 
 # -- Force arrow calibration -----------------------------------------------
 # The force scale is *absolute*: it never renormalises to whatever happens to
@@ -103,6 +112,12 @@ class RenderSettings:
     slice_axis: int = 2                # 0=x, 1=y, 2=z
     slice_pos: float = 0.0             # metres
 
+    show_bodies: bool = True
+    show_cloud: bool = True
+    hover_uid: int | None = None
+    measure_pair: tuple[int, int] | None = None
+    dot_scale: float = 1.0
+
     quality: float = 1.0               # <1 while dragging, for responsiveness
 
     def eff_field_grid(self) -> int:
@@ -180,9 +195,18 @@ class ForceLayer(Layer):
     """One arrow per charge, length proportional to |F| on a fixed scale."""
 
     def rebuild(self, scene, st: RenderSettings) -> None:
-        if not scene.charges:
+        # Point charges and whole bodies are drawn the same way: the net force
+        # on a body is the sum over its own sites of q E_external.
+        targets = list(scene.charges)
+        F = list(scene.forces())
+        body_F = scene.body_forces()
+        for b in scene.bodies:
+            if b.uid in body_F:
+                targets.append(b)
+                F.append(body_F[b.uid])
+        if not targets:
             return
-        F = scene.forces()
+        F = np.array(F).reshape(-1, 3)
         mag = np.linalg.norm(F, axis=1)
         lengths = force_arrow_length(mag, st.domain, st.force_gain)
 
@@ -192,8 +216,9 @@ class ForceLayer(Layer):
         if not keep.any():
             return
 
-        origins = np.array([c.position for c in scene.charges])[keep]
-        radii = np.array([c.radius for c in scene.charges])[keep]
+        origins = np.array([t.position for t in targets])[keep]
+        radii = np.array([getattr(t, "radius", None) or t.size()
+                          for t in targets])[keep]
         dirs = F[keep] / mag[keep][:, None]
         L = lengths[keep]
 
@@ -221,19 +246,27 @@ class EFieldLayer(Layer):
     """Fixed-length arrows on a 3-D grid, coloured by |E|."""
 
     def rebuild(self, scene, st: RenderSettings) -> None:
-        if not scene.charges:
+        state = scene.state()
+        if not len(state.q):
             return
         n = st.eff_field_grid()
         axis = np.linspace(-st.domain, st.domain, n)
         gx, gy, gz = np.meshgrid(axis, axis, axis, indexing="ij")
         pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
 
-        # Drop samples buried inside a charge, where the arrow would be hidden
-        # and the magnitude is dominated by the softening model.
-        pos = scene.positions()
-        rad = np.array([c.radius for c in scene.charges])
-        d = np.linalg.norm(pts[:, None, :] - pos[None, :, :], axis=2)
-        pts = pts[(d > 1.3 * rad[None, :]).all(axis=1)]
+        # Drop samples buried inside a charge or a body, where the arrow
+        # would be hidden and the magnitude is dominated by the regularisation
+        # rather than by anything physical.
+        keep = np.ones(len(pts), dtype=bool)
+        if scene.charges:
+            pos = scene.positions()
+            rad = np.array([c.radius for c in scene.charges])
+            d = np.linalg.norm(pts[:, None, :] - pos[None, :, :], axis=2)
+            keep &= (d > 1.3 * rad[None, :]).all(axis=1)
+        spacing = (2.0 * st.domain) / max(n - 1, 1)
+        for b in scene.bodies:
+            keep &= ~b.contains(pts, pad=0.35 * spacing)
+        pts = pts[keep]
         if len(pts) == 0:
             return
 
@@ -256,7 +289,6 @@ class EFieldLayer(Layer):
         t = np.asarray(norm(mag), dtype=float)
         colors = cmaps.map_rgba_float(st.field_cmap, t, 1.0)
 
-        spacing = (2.0 * st.domain) / max(n - 1, 1)
         length = st.field_len_frac * spacing
         dirs = E / mag[:, None]
         # Centre each glyph on its grid point rather than starting there.
@@ -278,7 +310,7 @@ class PotentialLayer(Layer):
     """Semi-transparent heatmap of V, as a volume render or a cut plane."""
 
     def rebuild(self, scene, st: RenderSettings) -> None:
-        if not scene.charges:
+        if not len(scene.state().q):
             return
         if st.pot_mode == "slice":
             self._rebuild_slice(scene, st)
@@ -289,8 +321,13 @@ class PotentialLayer(Layer):
     def _make_norm(self, V: np.ndarray, st: RenderSettings):
         """Return ``(norm, vmax)`` for this potential field, or ``None``."""
         a = np.abs(V[np.isfinite(V)])
-        if a.size == 0 or a.max() == 0:
+        if a.size == 0:
             return None
+        if a.max() == 0.0:
+            # Genuinely zero everywhere -- a cut plane through the symmetry
+            # plane of a dipole, say.  Draw it in the neutral middle of the
+            # colormap rather than drawing nothing, which reads as a bug.
+            return LinearNorm(-1.0, 1.0), 0.0
         vmax = float(np.percentile(a, 99.0))
         if vmax <= 0:
             vmax = float(a.max())
@@ -310,6 +347,10 @@ class PotentialLayer(Layer):
         still lifting the mid range above nothing.
         """
         return np.clip(np.abs(V) / max(vmax, 1e-300), 0.0, 1.0) ** 0.5
+
+    @staticmethod
+    def _degenerate(vmax: float) -> bool:
+        return vmax <= 0.0
 
     def _publish(self, norm, st: RenderSettings) -> None:
         sym = st.units.unit_symbol(Quantity.POTENTIAL)
@@ -332,7 +373,7 @@ class PotentialLayer(Layer):
 
         t = np.asarray(norm(V), dtype=float)                # [0, 1], 0.5 = zero
         rgb = cmaps.map_rgb(st.pot_cmap, t)
-        weight = self._opacity_weight(V, vmax)
+        weight = self._opacity_weight(V, vmax) if vmax > 0 else np.zeros_like(V)
         # The volume is composited from ~n stacked slices, so a per-voxel
         # alpha of `a` accumulates to 1 - (1 - a)^n across the stack.  Invert
         # that so `pot_alpha` means the opacity of a full traverse.
@@ -393,22 +434,163 @@ class PotentialLayer(Layer):
 
 
 # --------------------------------------------------------------------------
+class BodyLayer(Layer):
+    """The bodies themselves: one translucent mesh each.
+
+    Hover and selection only change a colour, so :meth:`apply_highlight` can
+    repaint them without going anywhere near the field solve -- otherwise
+    simply moving the mouse across a plate would re-evaluate the whole scene.
+    """
+
+    def __init__(self, view) -> None:
+        super().__init__(view)
+        self._by_uid: dict[int, object] = {}
+        self._geom: dict[int, tuple] = {}
+
+    BODY_AMBIENT = 0.55
+
+    def rebuild(self, scene, st: RenderSettings) -> None:
+        self._by_uid.clear()
+        self._geom.clear()
+        for b in scene.bodies:
+            tris, shade = shade_mesh(*b.mesh(), self.BODY_AMBIENT)
+            item = gl.GLMeshItem(vertexes=tris, smooth=False, shader=None,
+                                 glOptions="translucent", drawEdges=False)
+            item.setDepthValue(5)          # after opaque glyphs, before volume
+            self._add(item)
+            self._by_uid[b.uid] = item
+            self._geom[b.uid] = (tris, shade)
+        self.apply_highlight(scene, st.hover_uid, st.selected_uid,
+                             st.measure_pair)
+
+    def apply_highlight(self, scene, hover_uid, selected_uid,
+                        measure_pair=None) -> None:
+        pair = set(measure_pair or ())
+        for b in scene.bodies:
+            item = self._by_uid.get(b.uid)
+            if item is None:
+                continue
+            rgb = CONDUCTOR_RGB if b.is_conductor else INSULATOR_RGB
+            if b.uid == hover_uid or b.relax_t < 1.0:
+                # Go glassy while charge is settling, so the rush out to the
+                # surface is something you watch rather than infer.
+                alpha = BODY_ALPHA_HOVER
+            elif b.uid == selected_uid:
+                alpha, rgb = BODY_ALPHA_SELECTED, tuple(
+                    min(1.0, c * 1.35) for c in rgb)
+            elif b.uid in pair:
+                alpha, rgb = BODY_ALPHA_SELECTED, (0.35, 0.85, 0.65)
+            else:
+                alpha = BODY_ALPHA
+            tris, shade = self._geom[b.uid]
+            cols = np.empty((len(tris), 3, 4), dtype=np.float32)
+            cols[..., :3] = np.array(rgb, dtype=np.float32) * shade[:, None, None]
+            cols[..., 3] = alpha
+            item.setMeshData(vertexes=tris, vertexColors=cols, smooth=False)
+
+
+class ChargeCloudLayer(Layer):
+    """The charge sitting on each body, as one dot per site.
+
+    Dot area tracks |q| on that site, so the pile-up at a plate's rim or the
+    thinning at a sphere's poles is visible directly rather than having to be
+    inferred from a colour ramp.
+    """
+
+    MIN_PX, MAX_PX = 2.4, 11.0
+
+    def rebuild(self, scene, st: RenderSettings) -> None:
+        state = scene.state()
+        pos, col, size = [], [], []
+        for b in scene.bodies:
+            sites = state.body_sites.get(b.uid)
+            if sites is None or not len(sites[0]):
+                continue
+            p, q = sites
+            live = np.abs(q) > 0
+            if not live.any():
+                continue
+            p, q = p[live], q[live]
+            # Area proportional to |q|, normalised per body so a lightly
+            # charged body is still legible next to a heavily charged one.
+            ref = np.abs(q).max()
+            px = self.MIN_PX + (self.MAX_PX - self.MIN_PX) * np.sqrt(
+                np.abs(q) / ref)
+            rgba = np.where((q > 0)[:, None],
+                            np.array(POSITIVE_RGBA, dtype=np.float32),
+                            np.array(NEGATIVE_RGBA, dtype=np.float32))
+            pos.append(p)
+            col.append(rgba)
+            size.append(px * st.dot_scale)
+
+        if not pos:
+            return
+        item = gl.GLScatterPlotItem(pos=np.vstack(pos).astype(np.float32),
+                                    color=np.vstack(col).astype(np.float32),
+                                    size=np.concatenate(size).astype(np.float32),
+                                    pxMode=True)
+        item.setDepthValue(0)
+        self._add(item)
+
+
+class MeasureLayer(Layer):
+    """The probe between two conductors, with the reading beside it."""
+
+    def rebuild(self, scene, st: RenderSettings) -> None:
+        if not st.measure_pair:
+            return
+        m = scene.measure(*st.measure_pair)
+        if m is None:
+            return
+        a, b = scene.body(m["uid_a"]), scene.body(m["uid_b"])
+        pa, pb = a.position, b.position
+        self._add(_dashed(pa, pb, (0.35, 0.95, 0.72, 0.95)))
+
+        u = st.units
+        mid = 0.5 * (pa + pb) + np.array([0.0, 0.0, 0.05 * st.domain])
+        lines = [f"ΔV = {u.fmt(m['dV'], Quantity.POTENTIAL)}"]
+        if m["C"] is not None:
+            lines.append(f"C = {u.fmt(m['C'], Quantity.CAPACITANCE)}")
+        self.labels.add(mid, "   ".join(lines), (150, 250, 215), font_pt=10.5)
+        for body, key in ((a, "V_a"), (b, "V_b")):
+            self.labels.add(body.position + np.array([0.0, 0.0, body.size() * 1.25]),
+                            u.fmt(m[key], Quantity.POTENTIAL), (150, 250, 215))
+
+
+def _dashed(a, b, rgba, segments: int = 19):
+    """A dashed line, so the probe never reads as a physical wire."""
+    t = np.linspace(0.0, 1.0, 2 * segments)
+    pts = a + (b - a) * t[:, None]
+    keep = np.repeat(np.arange(segments) % 2 == 0, 2)
+    item = gl.GLLinePlotItem(pos=pts[keep].astype(np.float32), mode="lines",
+                             width=2.2, color=rgba, antialias=True)
+    item.setDepthValue(6)
+    return item
+
+
 class LayerStack:
     """Owns the layers and drives them from a single settings object."""
 
     def __init__(self, view) -> None:
         self.charges = ChargeLayer(view)
+        self.cloud = ChargeCloudLayer(view)
         self.force = ForceLayer(view)
         self.efield = EFieldLayer(view)
+        self.bodies = BodyLayer(view)
+        self.measure = MeasureLayer(view)
         self.potential = PotentialLayer(view)
-        # Draw order matters for translucency: opaque geometry first.
-        self.all: list[Layer] = [self.charges, self.force, self.efield,
+        # Draw order matters for translucency: opaque geometry, then the
+        # glassy bodies, then the potential volume over everything.
+        self.all: list[Layer] = [self.charges, self.cloud, self.force,
+                                 self.efield, self.bodies, self.measure,
                                  self.potential]
 
     def update(self, scene, st: RenderSettings) -> None:
         self.force.visible = st.show_force
         self.efield.visible = st.show_efield
         self.potential.visible = st.show_potential
+        self.bodies.visible = st.show_bodies
+        self.cloud.visible = st.show_cloud
         for layer in self.all:
             layer.update(scene, st)
 

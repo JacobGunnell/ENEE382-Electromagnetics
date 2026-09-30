@@ -80,6 +80,33 @@ LIGHT_DIR = np.array([0.42, 0.50, 0.76])
 LIGHT_DIR = LIGHT_DIR / np.linalg.norm(LIGHT_DIR)
 
 
+def face_shade(tris: np.ndarray, ambient: float) -> np.ndarray:
+    """Per-face brightness in ``[ambient, 1]`` from a fixed *world* light.
+
+    pyqtgraph's built-in 'shaded' shader lights from a direction fixed in eye
+    space and floors unlit faces at 0.2, which turns a plate whose normal runs
+    across the view almost black and swings a colour-coded glyph across the
+    whole colormap.  Shading against a world-space light with a raised floor
+    keeps both readable.
+    """
+    nrm = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    mag = np.linalg.norm(nrm, axis=1, keepdims=True)
+    nrm = np.divide(nrm, mag, out=np.zeros_like(nrm), where=mag > 0)
+    lam = np.abs(nrm @ LIGHT_DIR)
+    return (ambient + (1.0 - ambient) * lam).astype(np.float32)
+
+
+def shade_mesh(verts: np.ndarray, faces: np.ndarray, ambient: float
+               ) -> tuple[np.ndarray, np.ndarray]:
+    """Expand an indexed mesh to a shaded triangle soup.
+
+    Returns ``(tris, shade)``; multiply ``shade`` by an RGBA to get the vertex
+    colours, which is what lets hover recolour a body without re-meshing it.
+    """
+    tris = verts[faces].astype(np.float32)
+    return tris, face_shade(tris, ambient)
+
+
 def arrow_soup(origins: np.ndarray, directions: np.ndarray,
                lengths: np.ndarray, widths: np.ndarray,
                colors: np.ndarray, n_sides: int = 10,
@@ -116,13 +143,8 @@ def arrow_soup(origins: np.ndarray, directions: np.ndarray,
     cols = np.repeat(colors, len(base_f) * 3, axis=0).reshape(-1, 3, 4)
 
     if ambient is not None:
-        nrm = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
-        mag = np.linalg.norm(nrm, axis=1, keepdims=True)
-        nrm = np.divide(nrm, mag, out=np.zeros_like(nrm), where=mag > 0)
-        lam = np.abs(nrm @ LIGHT_DIR)                                # (n*F,)
-        shade = (ambient + (1.0 - ambient) * lam).astype(np.float32)
         cols = cols.copy()
-        cols[:, :, :3] *= shade[:, None, None]
+        cols[:, :, :3] *= face_shade(tris, ambient)[:, None, None]
     return tris.astype(np.float32), cols
 
 

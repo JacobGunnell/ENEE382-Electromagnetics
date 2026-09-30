@@ -35,6 +35,7 @@ class Quantity(str, Enum):
     POTENTIAL = "potential"
     FORCE = "force"
     ENERGY = "energy"
+    CAPACITANCE = "capacitance"
     # Present so that future magnetostatic / radiation layers need no changes
     # to the unit machinery.
     BFIELD = "bfield"
@@ -104,6 +105,7 @@ SI = UnitSystem(
         Quantity.POTENTIAL: Unit("V"),
         Quantity.FORCE: Unit("N"),
         Quantity.ENERGY: Unit("J"),
+        Quantity.CAPACITANCE: Unit("F"),
         Quantity.BFIELD: Unit("T"),
         Quantity.CURRENT: Unit("A"),
         Quantity.TIME: Unit("s"),
@@ -116,6 +118,7 @@ SI = UnitSystem(
         Quantity.POTENTIAL: Unit("V", 1.0),
         Quantity.FORCE: Unit("N", 1.0),
         Quantity.ENERGY: Unit("J", 1.0),
+        Quantity.CAPACITANCE: Unit("F", 1.0),
         Quantity.BFIELD: Unit("T", 1.0),
         Quantity.CURRENT: Unit("A", 1.0),
         Quantity.TIME: Unit("s", 1.0),
@@ -136,6 +139,9 @@ _GAUSSIAN_UNITS = {
     Quantity.POTENTIAL: Unit("statV", 1.0 / (_C_NUM * 1e-7)),
     Quantity.FORCE: Unit("dyn", 1e5),
     Quantity.ENERGY: Unit("erg", 1e7),
+    # In Gaussian units capacitance is a *length*: statC/statV = cm, and an
+    # isolated sphere of radius R has C = R exactly.  1 F = 8.98755e11 cm.
+    Quantity.CAPACITANCE: Unit("cm", _C_NUM**2 * 1e-7),
     Quantity.BFIELD: Unit("G", 1e4),
     Quantity.CURRENT: Unit("statA", _C_NUM),
     Quantity.TIME: Unit("s", 1.0),

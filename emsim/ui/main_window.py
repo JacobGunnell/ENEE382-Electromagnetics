@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from ..core import PointCharge, Scene
+from ..core import BODY_TYPES, Material, PointCharge, Scene
 from ..core.entities import radius_for_charge
 from ..units import SI, Quantity
 from ..viz.colorbar import ColorBarColumn
@@ -18,6 +18,13 @@ from .controls import ControlPanel
 #: interaction stays at interactive frame rates on modest hardware.
 DRAG_QUALITY = 0.6
 REDRAW_MS = 16
+#: Seconds for deposited charge to settle onto a conductor's surface.  Long
+#: enough to watch, short enough not to be in the way.
+RELAX_SECONDS = 0.75
+RELAX_MS = 16
+#: Conductor sites are coarsened this much while a body is dragged, because
+#: moving a body forces the O(N^3) factorisation to be rebuilt every frame.
+DRAG_SITE_SCALE = 0.45
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -54,9 +61,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._timer.setInterval(REDRAW_MS)
         self._timer.timeout.connect(self._redraw)
 
+        self._relax = QtCore.QTimer(self)
+        self._relax.setInterval(RELAX_MS)
+        self._relax.timeout.connect(self._step_relaxation)
+
+        self.measure_pair: list[int] = []
         self._connect()
         self.view.rebuild_decorations(self.settings.domain, self.settings.units)
         self.load_demo()
+        self.panel.sync_bodies()
         self._install_shortcuts()
 
     # ------------------------------------------------------------------
@@ -73,7 +86,15 @@ class MainWindow(QtWidgets.QMainWindow):
         p.resetViewRequested.connect(self.reset_view)
         p.forceFitRequested.connect(self.fit_force_scale)
 
-        v.chargeMoved.connect(self._on_charge_moved)
+        p.toolChanged.connect(self._on_tool_changed)
+        p.addBodyRequested.connect(self.add_body)
+        p.deleteBodyRequested.connect(self.delete_selected)
+        p.clearMeasureRequested.connect(self.clear_measurement)
+        p.exampleRequested.connect(self.load_example)
+
+        v.entityMoved.connect(self._on_charge_moved)
+        v.hoverChanged.connect(self._on_hover)
+        v.toolClicked.connect(self._on_tool_clicked)
         v.selectionChanged.connect(self._on_select_from_view)
         v.dragStarted.connect(self._on_drag_started)
         v.dragFinished.connect(self._on_drag_finished)
@@ -118,19 +139,81 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel.sync_table(charge.uid)
         self.request_redraw()
 
+    def add_body(self, name: str) -> None:
+        d = self.settings.domain
+        cls = BODY_TYPES[name]
+        body = cls(position=np.zeros(3), n_sites=220)
+        # Scale the default geometry to the region of interest.
+        for attr, _label in body.params:
+            setattr(body, attr, getattr(body, attr) * d)
+        if name in ("Line", "Loop"):
+            body.wire_radius = 0.012 * d
+        # Offset so a second body of the same kind does not land on the first.
+        same = [b for b in self.scene.bodies if b.kind == body.kind]
+        if same:
+            body.position = np.array([0.0, 0.0, (len(same) % 2 * 2 - 1)
+                                      * 0.35 * d])
+        self.scene.add_body(body)
+        self.view.set_selected(body.uid)
+        self.panel.sync_bodies(body.uid)
+        self.request_redraw()
+
+    def load_example(self, name: str) -> None:
+        """Preset scenes, so each feature has somewhere obvious to start."""
+        from ..core import Disk, Sphere
+        self.scene.clear()
+        self.clear_measurement()
+        d = self.settings.domain
+        if name == "Parallel plates":
+            for z, q in ((-0.18 * d, 4e-9), (0.18 * d, -4e-9)):
+                pl = Disk(radius=0.45 * d, position=[0, 0, z], axis=[0, 0, 1],
+                          n_sites=320)
+                pl.charge = q
+                self.scene.bodies.append(pl)
+            self.panel.tool_buttons.button(2).setChecked(True)
+            self.panel._on_tool(2)
+            self.measure_pair = [b.uid for b in self.scene.bodies]
+        elif name == "Sphere + point charge":
+            b = Sphere(radius=0.3 * d, position=[-0.25 * d, 0, 0], n_sites=320)
+            self.scene.bodies.append(b)
+            self.scene.charges.append(PointCharge(
+                q=12e-9, position=np.array([0.7 * d, 0.0, 0.0]),
+                radius=radius_for_charge(12e-9, d)))
+        elif name == "Insulating ball":
+            b = Sphere(radius=0.35 * d, position=np.zeros(3), n_sites=400,
+                       material=Material.INSULATOR)
+            b.charge = 8e-9
+            self.scene.bodies.append(b)
+        else:
+            for q, x in ((10e-9, -0.35 * d), (-10e-9, 0.35 * d)):
+                self.scene.charges.append(PointCharge(
+                    q=q, position=np.array([x, 0.0, 0.0]),
+                    radius=radius_for_charge(q, d)))
+        self.scene.notify("example")
+        self.panel.sync_table()
+        self.panel.sync_bodies()
+        self.request_redraw()
+
     def delete_selected(self) -> None:
         uid = self.view.selected_uid
         if uid is None:
             return
-        self.scene.remove_charge(uid)
+        if self.scene.body(uid) is not None:
+            self.scene.remove_body(uid)
+            self.measure_pair = [u for u in self.measure_pair if u != uid]
+        else:
+            self.scene.remove_charge(uid)
         self.view.set_selected(None)
         self.panel.sync_table()
+        self.panel.sync_bodies()
         self.request_redraw()
 
     def clear_charges(self) -> None:
         self.scene.clear()
         self.view.set_selected(None)
+        self.clear_measurement()
         self.panel.sync_table()
+        self.panel.sync_bodies()
         self.request_redraw()
 
     def fit_force_scale(self) -> None:
@@ -149,6 +232,64 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # Signal handlers
     # ------------------------------------------------------------------
+    def _on_tool_changed(self, tool: str) -> None:
+        self.view.tool = tool
+        msg = {"select": "Drag charges and bodies · Shift-drag for z · "
+                         "double-click empty space to add a charge",
+               "charge": "Click a body to deposit charge on it. On a "
+                         "conductor it will migrate to the surface.",
+               "measure": "Click two conductors to read ΔV and C between "
+                          "them."}
+        self.status.showMessage(msg.get(tool, ""))
+
+    def _on_tool_clicked(self, uid: int) -> None:
+        tool = self.panel.current_tool()
+        if tool == "charge":
+            if self.scene.body(uid) is None:
+                self.status.showMessage("Charge can only be deposited on a "
+                                        "body, not on a point charge.", 4000)
+                return
+            self.scene.deposit_charge(uid, self.panel.deposit_amount())
+            self.panel.sync_bodies(self.view.selected_uid)
+            self._relax.start()
+        elif tool == "measure":
+            body = self.scene.body(uid)
+            if body is None or not body.is_conductor:
+                self.status.showMessage("Voltage and capacitance are defined "
+                                        "between two conductors.", 4000)
+                return
+            if uid in self.measure_pair:
+                self.measure_pair.remove(uid)
+            else:
+                self.measure_pair.append(uid)
+                self.measure_pair = self.measure_pair[-2:]
+        self.request_redraw()
+
+    def clear_measurement(self) -> None:
+        self.measure_pair = []
+        self.panel.show_measurement(None)
+        self.request_redraw()
+
+    def _on_hover(self, uid) -> None:
+        """Repaint the hover highlight only -- never re-solve for a mouse move."""
+        self.settings.hover_uid = uid
+        self.layers.bodies.apply_highlight(
+            self.scene, uid, self.view.selected_uid, self.settings.measure_pair)
+        self.view.update()
+
+    def _step_relaxation(self) -> None:
+        step = RELAX_MS / 1000.0 / RELAX_SECONDS
+        busy = False
+        for b in self.scene.bodies:
+            if b.relax_t < 1.0:
+                b.relax_t = min(1.0, b.relax_t + step)
+                busy = busy or b.relax_t < 1.0
+        self.settings.quality = DRAG_QUALITY if busy else 1.0
+        self.scene.invalidate()
+        self._redraw()
+        if not busy:
+            self._relax.stop()
+
     def _on_units(self) -> None:
         self.view.rebuild_decorations(self.settings.domain, self.settings.units)
         self.panel.update_readout(self.view.selected_uid)
@@ -167,13 +308,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.request_redraw()
 
     def _on_charge_moved(self, uid: int) -> None:
-        self.panel.sync_table(uid)
+        self.scene.invalidate()
+        if self.scene.body(uid) is not None:
+            self.panel.sync_bodies(uid)
+        else:
+            self.panel.sync_table(uid)
         self.panel.update_readout(uid)
         self.request_redraw()
 
     def _on_select_from_view(self, uid) -> None:
         self.settings.selected_uid = uid
         self.panel.select_uid(uid)
+        self.panel.select_body(uid)
+        self.panel.show_body_editor(uid)
         self.panel.update_readout(uid)
         self.request_redraw()
 
@@ -183,9 +330,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_drag_started(self) -> None:
         self.settings.quality = DRAG_QUALITY
         self._timer.setInterval(0)
+        if self.scene.body(self.view.selected_uid) is not None:
+            self.scene.site_scale = DRAG_SITE_SCALE
 
     def _on_drag_finished(self) -> None:
         self.settings.quality = 1.0
+        self.scene.site_scale = 1.0
         self._timer.setInterval(REDRAW_MS)
         self.request_redraw()
 
@@ -195,8 +345,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._timer.start()
 
     def _redraw(self) -> None:
+        self.scene.invalidate()
         self.settings.selected_uid = self.view.selected_uid
+        self.settings.hover_uid = self.view.hover_uid
+        self.settings.measure_pair = (tuple(self.measure_pair)
+                                      if len(self.measure_pair) == 2 else None)
         self.layers.update(self.scene, self.settings)
+        self.panel.show_measurement(
+            self.scene.measure(*self.settings.measure_pair)
+            if self.settings.measure_pair else None)
         self.bars.set_scales(self.layers.scales(), self.settings.units)
 
         labels = list(self.layers.labels())

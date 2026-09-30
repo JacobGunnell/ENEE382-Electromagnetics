@@ -19,8 +19,8 @@ PICK_SLOP_PX = 8.0
 
 
 class View3D(gl.GLViewWidget):
-    #: emitted continuously while a charge is dragged
-    chargeMoved = QtCore.pyqtSignal(int)
+    #: emitted continuously while a charge or body is dragged
+    entityMoved = QtCore.pyqtSignal(int)
     #: uid or None
     selectionChanged = QtCore.pyqtSignal(object)
     dragStarted = QtCore.pyqtSignal()
@@ -29,12 +29,19 @@ class View3D(gl.GLViewWidget):
     addRequested = QtCore.pyqtSignal(object)
     #: emitted after every GL repaint, so 2-D overlays can follow the camera
     viewChanged = QtCore.pyqtSignal()
+    #: uid under the cursor, or None
+    hoverChanged = QtCore.pyqtSignal(object)
+    #: a uid clicked while a non-select tool is active
+    toolClicked = QtCore.pyqtSignal(int)
 
     def __init__(self, scene, parent=None) -> None:
         super().__init__(parent)
         self.scene = scene
         self.domain = 1.0
         self.selected_uid: int | None = None
+        self.hover_uid: int | None = None
+        #: "select" | "charge" | "measure"; set by the main window's tool bar.
+        self.tool = "select"
 
         self.setBackgroundColor(QtGui.QColor(18, 20, 26))
         self.setCameraPosition(distance=3.5, elevation=24, azimuth=35)
@@ -140,27 +147,46 @@ class View3D(gl.GLViewWidget):
     # ------------------------------------------------------------------
     # Picking
     # ------------------------------------------------------------------
-    def pick(self, x: float, y: float) -> int | None:
+    def pick(self, x: float, y: float) -> tuple[int | None, float]:
+        """Topmost entity under the cursor, as ``(uid, eye depth)``.
+
+        Point charges are matched in screen space, which keeps small spheres
+        comfortably clickable; bodies are matched by true ray casting against
+        their geometry.  Both are reduced to an eye-space depth so the two can
+        be compared and the nearer one wins.
+        """
+        best_uid, best_depth = None, float("inf")
+
         charges = self.scene.charges
-        if not charges:
-            return None
-        pos = np.array([c.position for c in charges])
-        screen, depth = self.project(pos)
+        if charges:
+            pos = np.array([c.position for c in charges])
+            screen, depth = self.project(pos)
+            right = np.cross(self.camera_forward(), np.array([0.0, 0.0, 1.0]))
+            n = np.linalg.norm(right)
+            right = right / n if n > 0 else np.array([1.0, 0.0, 0.0])
+            radii = np.array([c.radius for c in charges])
+            edge, _ = self.project(pos + right[None, :] * radii[:, None])
+            r_px = np.linalg.norm(edge - screen, axis=1) + PICK_SLOP_PX
+            dist = np.linalg.norm(screen - np.array([x, y]), axis=1)
+            hits = np.where((dist <= r_px) & (depth > 0))[0]
+            if hits.size:
+                k = int(hits[np.argmin(depth[hits])])
+                best_uid, best_depth = charges[k].uid, float(depth[k])
 
-        # Screen radius: project a point offset by the sphere radius along the
-        # camera's right vector so the hit target matches what is drawn.
-        right = np.cross(self.camera_forward(), np.array([0.0, 0.0, 1.0]))
-        n = np.linalg.norm(right)
-        right = right / n if n > 0 else np.array([1.0, 0.0, 0.0])
-        radii = np.array([c.radius for c in charges])
-        edge, _ = self.project(pos + right[None, :] * radii[:, None])
-        r_px = np.linalg.norm(edge - screen, axis=1) + PICK_SLOP_PX
-
-        dist = np.linalg.norm(screen - np.array([x, y]), axis=1)
-        hits = np.where((dist <= r_px) & (depth > 0))[0]
-        if hits.size == 0:
-            return None
-        return charges[int(hits[np.argmin(depth[hits])])].uid
+        bodies = getattr(self.scene, "bodies", [])
+        if bodies:
+            origin, direction = self.ray(x, y)
+            cam = self.cameraPosition()
+            cam = np.array([cam.x(), cam.y(), cam.z()])
+            fwd = self.camera_forward()
+            for b in bodies:
+                t = b.raycast(origin, direction)
+                if t is None:
+                    continue
+                depth = float((origin + t * direction - cam) @ fwd)
+                if 0 < depth < best_depth:
+                    best_uid, best_depth = b.uid, depth
+        return best_uid, best_depth
 
     def set_selected(self, uid: int | None) -> None:
         if uid != self.selected_uid:
@@ -173,7 +199,16 @@ class View3D(gl.GLViewWidget):
     def mousePressEvent(self, ev) -> None:
         p = ev.position()
         if ev.button() == QtCore.Qt.MouseButton.LeftButton:
-            uid = self.pick(p.x(), p.y())
+            uid, _ = self.pick(p.x(), p.y())
+            if self.tool != "select":
+                # A tool consumes the click on an entity; clicking past
+                # everything still orbits the camera.
+                if uid is not None:
+                    self.toolClicked.emit(uid)
+                    ev.accept()
+                    return
+                super().mousePressEvent(ev)
+                return
             self.set_selected(uid)
             if uid is not None:
                 charge = self.scene.by_uid(uid)
@@ -208,13 +243,19 @@ class View3D(gl.GLViewWidget):
                                        target[2]])
                 lim = 4.0 * self.domain
                 charge.position = np.clip(target, -lim, lim)
-                self.chargeMoved.emit(self._drag_uid)
+                self.entityMoved.emit(self._drag_uid)
             ev.accept()
             return
 
-        if self.scene.charges:
-            over = self.pick(p.x(), p.y()) is not None
-            self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor if over
+        uid, _ = self.pick(p.x(), p.y())
+        if uid != self.hover_uid:
+            self.hover_uid = uid
+            self.hoverChanged.emit(uid)
+        if self.tool != "select":
+            self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor if uid
+                           else QtCore.Qt.CursorShape.CrossCursor)
+        else:
+            self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor if uid
                            else QtCore.Qt.CursorShape.ArrowCursor)
         super().mouseMoveEvent(ev)
 
@@ -228,7 +269,8 @@ class View3D(gl.GLViewWidget):
     def mouseDoubleClickEvent(self, ev) -> None:
         p = ev.position()
         if (ev.button() == QtCore.Qt.MouseButton.LeftButton
-                and self.pick(p.x(), p.y()) is None):
+                and self.tool == "select"
+                and self.pick(p.x(), p.y())[0] is None):
             origin, direction = self.ray(p.x(), p.y())
             ctr = self.opts["center"]
             hit = self._plane_hit(origin, direction,

@@ -5,12 +5,20 @@ from __future__ import annotations
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from ..core.bodies import BODY_TYPES, Material
 from ..core.entities import radius_for_charge
 from ..units import UNIT_SYSTEMS, Quantity, UnitSystem
 from ..viz import colormaps as cmaps
 from ..viz.layers import RenderSettings, force_gain_for
 
 COL_LABEL, COL_Q, COL_X, COL_Y, COL_Z = range(5)
+BCOL_LABEL, BCOL_KIND, BCOL_MAT, BCOL_Q = range(4)
+
+TOOLS = (("select", "Select", "Click to select, drag to move."),
+         ("charge", "Add charge", "Click a body to deposit the charge below "
+                                  "on it, spread uniformly."),
+         ("measure", "Measure", "Click two conductors to read their voltage "
+                                "difference and capacitance."))
 
 #: Force-gain slider: value v maps to a gain of 10**(v / GAIN_DECADE),
 #: spanning 1e-6 to 1e+6.
@@ -57,6 +65,11 @@ class ControlPanel(QtWidgets.QWidget):
     clearRequested = QtCore.pyqtSignal()
     resetViewRequested = QtCore.pyqtSignal()
     forceFitRequested = QtCore.pyqtSignal()
+    toolChanged = QtCore.pyqtSignal(str)
+    addBodyRequested = QtCore.pyqtSignal(str)
+    deleteBodyRequested = QtCore.pyqtSignal()
+    clearMeasureRequested = QtCore.pyqtSignal()
+    exampleRequested = QtCore.pyqtSignal(str)
 
     def __init__(self, scene, settings: RenderSettings, parent=None) -> None:
         super().__init__(parent)
@@ -78,6 +91,9 @@ class ControlPanel(QtWidgets.QWidget):
         scroll.setWidget(body)
 
         self._build_units()
+        self._build_tools()
+        self._build_bodies()
+        self._build_measure()
         self._build_force()
         self._build_efield()
         self._build_potential()
@@ -121,6 +137,130 @@ class ControlPanel(QtWidgets.QWidget):
         btn.clicked.connect(self.resetViewRequested.emit)
         lay.addWidget(btn)
         self.v.addWidget(box)
+
+    def _build_tools(self) -> None:
+        box, lay = _group("Tool")
+        self.tool_buttons = QtWidgets.QButtonGroup(self)
+        self.tool_buttons.setExclusive(True)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(4)
+        for i, (key, label, tip) in enumerate(TOOLS):
+            b = QtWidgets.QToolButton()
+            b.setText(label)
+            b.setCheckable(True)
+            b.setToolTip(tip)
+            b.setChecked(i == 0)
+            b.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                            QtWidgets.QSizePolicy.Policy.Fixed)
+            self.tool_buttons.addButton(b, i)
+            row.addWidget(b)
+        self.tool_buttons.idClicked.connect(self._on_tool)
+        lay.addLayout(row)
+
+        self.deposit = QtWidgets.QDoubleSpinBox()
+        self.deposit.setRange(-1e12, 1e12)
+        self.deposit.setDecimals(4)
+        self.deposit.setValue(10.0)
+        self.deposit_row = _row("Deposit", self.deposit, 0)
+        lay.addWidget(self.deposit_row)
+
+        self.tool_hint = QtWidgets.QLabel(TOOLS[0][2])
+        self.tool_hint.setWordWrap(True)
+        self.tool_hint.setStyleSheet("color: #8a93a6; font-size: 10px;")
+        lay.addWidget(self.tool_hint)
+        self.v.addWidget(box)
+
+    def _build_bodies(self) -> None:
+        box, lay = _group("Bodies")
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(3)
+        for name in BODY_TYPES:
+            b = QtWidgets.QPushButton(name)
+            b.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                            QtWidgets.QSizePolicy.Policy.Fixed)
+            b.clicked.connect(lambda _c, n=name: self.addBodyRequested.emit(n))
+            row.addWidget(b)
+        lay.addLayout(row)
+
+        self.btable = QtWidgets.QTableWidget(0, 4)
+        self.btable.verticalHeader().setVisible(False)
+        self.btable.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.btable.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.btable.setMinimumHeight(110)
+        hh = self.btable.horizontalHeader()
+        hh.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.btable.itemChanged.connect(self._on_body_table_edit)
+        self.btable.itemSelectionChanged.connect(self._on_body_table_select)
+        lay.addWidget(self.btable)
+
+        # -- editor for the selected body
+        self.mat_combo = QtWidgets.QComboBox()
+        self.mat_combo.addItems(["Conductor", "Insulator"])
+        self.mat_combo.currentIndexChanged.connect(self._on_body_edit)
+        self.body_rows = [_row("Material", self.mat_combo, 0)]
+
+        self.axis_combo = QtWidgets.QComboBox()
+        self.axis_combo.addItems(["x", "y", "z"])
+        self.axis_combo.setCurrentIndex(2)
+        self.axis_combo.currentIndexChanged.connect(self._on_body_edit)
+        self.axis_row = _row("Axis / normal", self.axis_combo, 0)
+        self.body_rows.append(self.axis_row)
+
+        self.size_spins, self.size_rows = [], []
+        for _ in range(2):
+            sp = QtWidgets.QDoubleSpinBox()
+            sp.setRange(1e-6, 1e9)
+            sp.setDecimals(4)
+            sp.valueChanged.connect(self._on_body_edit)
+            r = _row("", sp, 0)
+            self.size_spins.append(sp)
+            self.size_rows.append(r)
+            self.body_rows.append(r)
+
+        self.sites_spin = QtWidgets.QSpinBox()
+        self.sites_spin.setRange(16, 1200)
+        self.sites_spin.setSingleStep(20)
+        self.sites_spin.setValue(220)
+        self.sites_spin.valueChanged.connect(self._on_body_edit)
+        self.sites_spin.setToolTip(
+            "Number of elements this body is discretised into. More elements "
+            "resolve the edge pile-up better; cost of the conductor solve "
+            "grows as the cube of the total.")
+        self.body_rows.append(_row("Elements", self.sites_spin, 0))
+
+        for r in self.body_rows:
+            lay.addWidget(r)
+
+        btns = QtWidgets.QHBoxLayout()
+        self.del_body_btn = QtWidgets.QPushButton("Delete body")
+        self.del_body_btn.clicked.connect(self.deleteBodyRequested.emit)
+        btns.addWidget(self.del_body_btn)
+        self.example_combo = QtWidgets.QComboBox()
+        self.example_combo.addItems(["Examples…", "Parallel plates",
+                                     "Sphere + point charge",
+                                     "Insulating ball", "Dipole"])
+        self.example_combo.activated.connect(self._on_example)
+        btns.addWidget(self.example_combo)
+        lay.addLayout(btns)
+        self.v.addWidget(box)
+
+    def _build_measure(self) -> None:
+        box, lay = _group("Capacitance")
+        self.measure_out = QtWidgets.QLabel()
+        self.measure_out.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.measure_out.setWordWrap(True)
+        self.measure_out.setStyleSheet("font-size: 11px;")
+        self.measure_out.setMinimumHeight(150)
+        self.measure_out.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop
+                                      | QtCore.Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self.measure_out)
+        self.clear_measure = QtWidgets.QPushButton("Clear selection")
+        self.clear_measure.clicked.connect(self.clearMeasureRequested.emit)
+        lay.addWidget(self.clear_measure)
+        self.v.addWidget(box)
+        self.show_measurement(None)
 
     def _build_force(self) -> None:
         box, lay = _group("Force on charges")
@@ -358,6 +498,219 @@ class ControlPanel(QtWidgets.QWidget):
             w.setEnabled(on and is_slice)
             w.setVisible(is_slice)
 
+    # -- tools -------------------------------------------------------------
+    def _on_tool(self, index: int) -> None:
+        key, _label, tip = TOOLS[index]
+        self.tool_hint.setText(tip)
+        self.deposit_row.setVisible(key == "charge")
+        self.toolChanged.emit(key)
+
+    def current_tool(self) -> str:
+        return TOOLS[max(self.tool_buttons.checkedId(), 0)][0]
+
+    def deposit_amount(self) -> float:
+        return self.units.from_entry(self.deposit.value(), Quantity.CHARGE)
+
+    def _on_example(self, index: int) -> None:
+        if index > 0:
+            self.exampleRequested.emit(self.example_combo.itemText(index))
+        self.example_combo.setCurrentIndex(0)
+
+    # -- bodies ------------------------------------------------------------
+    def selected_body_uid(self) -> int | None:
+        rows = self.btable.selectionModel().selectedRows()
+        if not rows:
+            return None
+        it = self.btable.item(rows[0].row(), BCOL_LABEL)
+        return it.data(QtCore.Qt.ItemDataRole.UserRole) if it else None
+
+    def sync_bodies(self, keep_uid: int | None = None) -> None:
+        if keep_uid is None:
+            keep_uid = self.selected_body_uid()
+        self._syncing = True
+        u = self.units
+        self.btable.setHorizontalHeaderLabels(
+            ["", "Type", "Material", f"Q ({u.entry_symbol(Quantity.CHARGE)})"])
+        self.btable.setRowCount(len(self.scene.bodies))
+        for r, b in enumerate(self.scene.bodies):
+            vals = [b.label, b.kind.title(),
+                    "Conductor" if b.is_conductor else "Insulator",
+                    f"{u.to_entry(b.charge, Quantity.CHARGE):.4g}"]
+            for col, text in enumerate(vals):
+                item = self.btable.item(r, col)
+                if item is None:
+                    item = QtWidgets.QTableWidgetItem()
+                    if col != BCOL_Q:
+                        item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled
+                                      | QtCore.Qt.ItemFlag.ItemIsSelectable)
+                    self.btable.setItem(r, col, item)
+                item.setText(text)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, b.uid)
+                if col == BCOL_Q:
+                    item.setForeground(QtGui.QColor(
+                        "#f0594f" if b.charge > 0 else
+                        "#4f8ef0" if b.charge < 0 else "#bbb"))
+        self._syncing = False
+        if keep_uid is not None:
+            self.select_body(keep_uid)
+        self.show_body_editor(keep_uid)
+
+    def select_body(self, uid: int | None) -> None:
+        prev = self._syncing
+        self._syncing = True
+        self.btable.clearSelection()
+        if uid is not None:
+            for r in range(self.btable.rowCount()):
+                it = self.btable.item(r, BCOL_LABEL)
+                if it is not None and it.data(QtCore.Qt.ItemDataRole.UserRole) == uid:
+                    self.btable.selectRow(r)
+                    break
+        self._syncing = prev
+
+    def show_body_editor(self, uid: int | None) -> None:
+        """Retarget the size fields at whichever body is selected."""
+        body = self.scene.body(uid) if uid is not None else None
+        for r in self.body_rows:
+            r.setVisible(body is not None)
+        self.del_body_btn.setEnabled(body is not None)
+        if body is None:
+            return
+        self._syncing = True
+        self.mat_combo.setCurrentIndex(0 if body.is_conductor else 1)
+        self.axis_row.setVisible(body.kind != "sphere")
+        self.axis_combo.setCurrentIndex(int(np.argmax(np.abs(body.axis))))
+        self.sites_spin.setValue(int(body.n_sites))
+        ls = self.units.entry_symbol(Quantity.LENGTH)
+        for i, (spin, row) in enumerate(zip(self.size_spins, self.size_rows)):
+            if i < len(body.params):
+                attr, label = body.params[i]
+                row.setVisible(True)
+                row.layout().itemAt(0).widget().setText(f"{label} ({ls})")
+                spin.setValue(self.units.to_entry(getattr(body, attr),
+                                                 Quantity.LENGTH))
+            else:
+                row.setVisible(False)
+        self._syncing = False
+
+    def _on_body_table_select(self) -> None:
+        if self._syncing:
+            return
+        rows = self.btable.selectionModel().selectedRows()
+        uid = None
+        if rows:
+            it = self.btable.item(rows[0].row(), BCOL_LABEL)
+            uid = it.data(QtCore.Qt.ItemDataRole.UserRole) if it else None
+        self.selectRequested.emit(uid)
+
+    def _on_body_table_edit(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._syncing or item.column() != BCOL_Q:
+            return
+        body = self.scene.body(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        if body is None:
+            return
+        try:
+            body.charge = self.units.from_entry(float(item.text()),
+                                                Quantity.CHARGE)
+        except ValueError:
+            pass
+        self.scene.invalidate()
+        self.sceneEdited.emit()
+
+    def _on_body_edit(self, *_a) -> None:
+        if self._syncing:
+            return
+        rows = self.btable.selectionModel().selectedRows()
+        if not rows:
+            return
+        it = self.btable.item(rows[0].row(), BCOL_LABEL)
+        body = self.scene.body(it.data(QtCore.Qt.ItemDataRole.UserRole))
+        if body is None:
+            return
+        body.material = (Material.CONDUCTOR if self.mat_combo.currentIndex() == 0
+                         else Material.INSULATOR)
+        axis = np.zeros(3)
+        axis[self.axis_combo.currentIndex()] = 1.0
+        body.axis = axis
+        body.n_sites = self.sites_spin.value()
+        for i, (attr, _label) in enumerate(body.params[:len(self.size_spins)]):
+            setattr(body, attr, self.units.from_entry(
+                self.size_spins[i].value(), Quantity.LENGTH))
+        self.scene.invalidate()
+        self.sceneEdited.emit()
+
+    # -- measurement -------------------------------------------------------
+    def show_measurement(self, m) -> None:
+        u = self.units
+        if m is None:
+            self.measure_out.setText(
+                "<span style='color:#8a93a6'>Pick the <b>Measure</b> tool, "
+                "then click two conductors.</span>")
+            return
+        a = self.scene.body(m["uid_a"])
+        b = self.scene.body(m["uid_b"])
+        rows = [
+            (f"V({a.label})", u.fmt(m["V_a"], Quantity.POTENTIAL)),
+            (f"V({b.label})", u.fmt(m["V_b"], Quantity.POTENTIAL)),
+            ("ΔV", u.fmt(m["dV"], Quantity.POTENTIAL)),
+            (f"Q({a.label})", u.fmt(m["Q_a"], Quantity.CHARGE)),
+            (f"Q({b.label})", u.fmt(m["Q_b"], Quantity.CHARGE)),
+            ("C", u.fmt(m["C"], Quantity.CAPACITANCE) if m["C"] else "—"),
+        ]
+        if m["C_measured"] is not None:
+            rows.append(("Q/ΔV", u.fmt(m["C_measured"], Quantity.CAPACITANCE)))
+        if m["energy"] is not None:
+            rows.append(("½CΔV²", u.fmt(m["energy"], Quantity.ENERGY)))
+        cells = "".join(
+            f"<tr><td style='color:#9aa4b8;padding-right:8px'>{k}</td>"
+            f"<td style='color:#e8edf6'>{v}</td></tr>" for k, v in rows)
+        note = ""
+        if not m["balanced"]:
+            note = ("<div style='color:#c9a227;font-size:10px;margin-top:4px'>"
+                    "Charges are not equal and opposite, so Q/ΔV is not the "
+                    "capacitance. C above is the geometric value.</div>")
+        self.measure_out.setText(
+            f"<table cellspacing='0'>{cells}</table>{note}")
+
+    def _charge_rows(self, charge) -> list[tuple[str, str]]:
+        u = self.units
+        sample = self.scene.evaluate(charge.position[None, :],
+                                     exclude_uid=charge.uid)
+        E, V = sample["E"][0], float(sample["V"][0])
+        F = charge.q * E
+        return [
+            ("q", u.fmt(charge.q, Quantity.CHARGE)),
+            ("r", "(" + ", ".join(u.fmt(x, Quantity.LENGTH)
+                                  for x in charge.position) + ")"),
+            ("|F|", u.fmt(float(np.linalg.norm(F)), Quantity.FORCE)),
+            ("|E|", u.fmt(float(np.linalg.norm(E)), Quantity.EFIELD)),
+            ("V", u.fmt(V, Quantity.POTENTIAL)),
+        ]
+
+    def _body_rows(self, body) -> list[tuple[str, str]]:
+        u = self.units
+        state = self.scene.state()
+        rows = [
+            ("body", f"{body.label} · {body.kind}"),
+            ("material", "conductor" if body.is_conductor else "insulator"),
+            ("Q", u.fmt(body.charge, Quantity.CHARGE)),
+            ("r", "(" + ", ".join(u.fmt(x, Quantity.LENGTH)
+                                  for x in body.position) + ")"),
+        ]
+        if body.uid in state.potentials:
+            rows.append(("V", u.fmt(state.potentials[body.uid],
+                                    Quantity.POTENTIAL)))
+            i = state.system.index_of(body.uid)
+            if i is not None and state.system.p_cond[i, i] > 0:
+                # Self-capacitance: what this conductor alone would hold,
+                # referenced to infinity.
+                rows.append(("C self", u.fmt(1.0 / state.system.p_cond[i, i],
+                                             Quantity.CAPACITANCE)))
+        F = self.scene.body_forces().get(body.uid)
+        if F is not None:
+            rows.append(("|F|", u.fmt(float(np.linalg.norm(F)),
+                                      Quantity.FORCE)))
+        return rows
+
     def _update_gain_label(self) -> None:
         g = self.st.force_gain
         text = f"{g:.2f}×" if 0.01 <= g < 1000 else f"{g:.0e}×"
@@ -388,9 +741,11 @@ class ControlPanel(QtWidgets.QWidget):
         self.domain_spin.setValue(u.to_entry(self.st.domain, Quantity.LENGTH))
         self.domain_spin.setSingleStep(
             max(u.to_entry(self.st.domain, Quantity.LENGTH) / 10.0, 1e-6))
+        self.deposit.setSuffix(f"  {qs}")
         self._syncing = False
         self._update_slice_label()
         self.sync_table()
+        self.sync_bodies()
 
     # -- charge table ------------------------------------------------------
     def sync_table(self, keep_uid: int | None = None) -> None:
@@ -460,28 +815,18 @@ class ControlPanel(QtWidgets.QWidget):
         elif col in (COL_X, COL_Y, COL_Z):
             charge.position[col - COL_X] = self.units.from_entry(
                 value, Quantity.LENGTH)
+        self.scene.invalidate()
         self.sceneEdited.emit()
 
     # -- readout -----------------------------------------------------------
     def update_readout(self, uid: int | None) -> None:
-        charge = self.scene.by_uid(uid) if uid is not None else None
-        if charge is None:
+        entity = self.scene.by_uid(uid) if uid is not None else None
+        if entity is None:
             self.readout.setText("<span style='color:#8a93a6'>"
-                                 "No charge selected</span>")
+                                 "Nothing selected</span>")
             return
-        u = self.units
-        sample = self.scene.evaluate(charge.position[None, :],
-                                     exclude_uid=charge.uid)
-        E, V = sample["E"][0], float(sample["V"][0])
-        F = charge.q * E
-        rows = [
-            ("q", u.fmt(charge.q, Quantity.CHARGE)),
-            ("r", "(" + ", ".join(u.fmt(x, Quantity.LENGTH)
-                                  for x in charge.position) + ")"),
-            ("|F|", u.fmt(float(np.linalg.norm(F)), Quantity.FORCE)),
-            ("|E|", u.fmt(float(np.linalg.norm(E)), Quantity.EFIELD)),
-            ("V", u.fmt(V, Quantity.POTENTIAL)),
-        ]
+        rows = (self._body_rows(entity) if hasattr(entity, "material")
+                else self._charge_rows(entity))
         cells = "".join(
             f"<tr><td style='color:#9aa4b8;padding-right:8px'>{k}</td>"
             f"<td style='color:#e8edf6'>{v}</td></tr>" for k, v in rows)
