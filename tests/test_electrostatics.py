@@ -382,3 +382,43 @@ def test_a_scene_of_only_bodies_still_evaluates_fields():
     out = s.evaluate([[1.0, 0.0, 0.0]])
     assert np.linalg.norm(out["E"][0]) > 0
     assert out["V"][0] > 0
+
+
+# -- the unified object list -----------------------------------------------
+def test_objects_lists_charges_and_bodies_together_in_creation_order():
+    """The panel shows one list, so the model offers one."""
+    s = Scene()
+    a = s.add_body(Sphere(radius=0.2))
+    b = s.add_charge(PointCharge(q=1e-9, position=[0, 0, 0]))
+    c = s.add_body(Disk(radius=0.3))
+    d = s.add_charge(PointCharge(q=-1e-9, position=[1, 0, 0]))
+    assert [o.uid for o in s.objects()] == [a.uid, b.uid, c.uid, d.uid]
+    assert len(s.objects()) == len(s.charges) + len(s.bodies)
+
+
+def test_objects_order_survives_removal():
+    s = Scene()
+    a = s.add_body(Sphere(radius=0.2))
+    b = s.add_charge(PointCharge(q=1e-9, position=[0, 0, 0]))
+    c = s.add_body(Disk(radius=0.3))
+    s.remove_charge(b.uid)
+    assert [o.uid for o in s.objects()] == [a.uid, c.uid]
+    s.remove_body(a.uid)
+    assert [o.uid for o in s.objects()] == [c.uid]
+
+
+def test_objects_is_empty_for_an_empty_scene():
+    assert Scene().objects() == []
+
+
+def test_every_object_exposes_what_the_list_shows():
+    """One table, so both kinds need position, a charge and a label."""
+    s = Scene()
+    s.add_charge(PointCharge(q=2e-9, position=[0.1, 0, 0]))
+    s.add_body(Disk(radius=0.3))
+    for o in s.objects():
+        assert isinstance(o.label, str) and o.label
+        assert o.position.shape == (3,)
+        charge = o.charge if hasattr(o, "material") else o.q
+        assert isinstance(float(charge), float)
+        assert s.by_uid(o.uid) is o

@@ -25,8 +25,9 @@ class View3D(gl.GLViewWidget):
     selectionChanged = QtCore.pyqtSignal(object)
     dragStarted = QtCore.pyqtSignal()
     dragFinished = QtCore.pyqtSignal()
-    #: double-click on empty space, carries a world position (3,)
-    addRequested = QtCore.pyqtSignal(object)
+    #: double-click on empty space: world position (3,) and the global screen
+    #: point to pop the "what do you want to add" menu at
+    addRequested = QtCore.pyqtSignal(object, object)
     #: emitted after every GL repaint, so 2-D overlays can follow the camera
     viewChanged = QtCore.pyqtSignal()
     #: uid under the cursor, or None
@@ -278,7 +279,8 @@ class View3D(gl.GLViewWidget):
                                   self.camera_forward())
             if hit is not None:
                 lim = self.domain
-                self.addRequested.emit(np.clip(hit, -lim, lim))
+                self.addRequested.emit(np.clip(hit, -lim, lim),
+                                       ev.globalPosition().toPoint())
                 ev.accept()
                 return
         super().mouseDoubleClickEvent(ev)

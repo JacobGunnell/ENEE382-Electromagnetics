@@ -12,7 +12,7 @@ Built on PyQt6 + pyqtgraph's OpenGL viewport, in a `uv`-managed venv.
 
 ```sh
 uv run main.py          # or: uv run emsim
-uv run pytest           # 137 tests, no display required
+uv run pytest           # 146 tests, no display required
 ```
 
 `uv sync` provisions Python 3.13 and the dependencies on first run.
@@ -26,12 +26,17 @@ Three tools, picked at the top of the panel.
 | Action | Input |
 | --- | --- |
 | Orbit / pan / zoom | drag empty space · middle-drag · wheel |
-| Select a charge or body | click it |
+| Select an object | click it |
 | Move it in the view plane | drag it |
 | Move it along **z** | shift-drag it |
-| Add a point charge | double-click empty space, or `Ctrl+N` |
+| Add something | double-click empty space and pick from the menu |
+| Add a point charge directly | `Ctrl+N` |
 | Delete the selection | `Del` |
 | Reset the camera | `Ctrl+R` |
+
+Double-clicking empty space opens a menu — point charge, line, loop, sheet,
+disk, sphere — and puts the chosen object where you clicked. The same six are
+buttons above the object list.
 
 **Add charge** — click a body to deposit the amount in the spin box onto it,
 spread uniformly. Clicking again adds more. On an insulator the charge stays
@@ -40,9 +45,14 @@ where it lands; on a conductor it migrates to the surface (see below).
 **Measure** — click two conductors to read the voltage between them and the
 capacitance of the pair.
 
-Everything is also editable numerically in the tables on the right, in whichever
-unit system is active. **Hovering** a body makes it glassy so you can see the
-charge inside it.
+Everything in the scene lives in **one object list** on the right — point
+charges and bodies together, in creation order — with charge and position
+editable in place, in whichever unit system is active. Selecting a body reveals
+the extra fields only a body has (material, axis, size, element count). The
+*Type* column is coloured to match how the object is drawn, so the list reads
+like the viewport.
+
+**Hovering** a body makes it glassy so you can see the charge inside it.
 
 ## Bodies
 
@@ -255,7 +265,7 @@ emsim/
     overlay.py      2-D label layer stacked over the viewport
     colorbar.py     QPainter colorbar driven by a ColorScale
   ui/
-    controls.py     right-hand panel
+    controls.py     right-hand panel: tools, the object list, readouts
     main_window.py  wiring + coalesced redraw loop
 ```
 

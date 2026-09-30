@@ -14,6 +14,13 @@ from dataclasses import dataclass, field
 import numpy as np
 
 _uid_counter = itertools.count(1)
+#: Shared by point charges and bodies so the object list can be shown in true
+#: creation order rather than grouped by which kind of thing it is.
+_seq_counter = itertools.count(1)
+
+
+def next_seq() -> int:
+    return next(_seq_counter)
 
 
 @dataclass
@@ -34,6 +41,7 @@ class PointCharge:
     radius: float = 0.03                       # m, softening / render radius
     label: str = ""
     uid: int = field(default_factory=lambda: next(_uid_counter))
+    seq: int = field(default_factory=next_seq)
 
     def __post_init__(self) -> None:
         self.position = np.asarray(self.position, dtype=float).reshape(3)

@@ -26,6 +26,8 @@ from enum import Enum
 
 import numpy as np
 
+from .entities import next_seq
+
 GOLDEN_ANGLE = math.pi * (3.0 - math.sqrt(5.0))
 _uid_counter = itertools.count(1000)
 
@@ -120,6 +122,7 @@ class Body:
     n_sites: int = 220
     label: str = ""
     uid: int = field(default_factory=lambda: next(_uid_counter))
+    seq: int = field(default_factory=next_seq)
 
     #: Relaxation progress after charge is deposited: 0 = just placed and
     #: still spread uniformly, 1 = settled at equilibrium.  Only meaningful

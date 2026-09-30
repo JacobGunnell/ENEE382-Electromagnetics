@@ -90,6 +90,14 @@ class Scene:
         self.bodies.clear()
         self.notify("cleared")
 
+    def objects(self) -> list:
+        """Point charges and bodies as one list, in creation order.
+
+        The UI shows a single object list, so the model offers one too rather
+        than making every caller stitch the two together.
+        """
+        return sorted(self.charges + self.bodies, key=lambda o: o.seq)
+
     def by_uid(self, uid: int):
         for c in self.charges:
             if c.uid == uid:

@@ -7,12 +7,12 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from ..core import BODY_TYPES, Material, PointCharge, Scene
 from ..core.entities import radius_for_charge
-from ..units import SI, Quantity
+from ..units import SI
 from ..viz.colorbar import ColorBarColumn
 from ..viz.layers import LayerStack, RenderSettings
 from ..viz.overlay import Label3D, ViewportStack
 from ..viz.view3d import View3D
-from .controls import ControlPanel
+from .controls import POINT, OBJECT_TYPES, ControlPanel
 
 #: While dragging, rebuild the field/volume at reduced resolution so the
 #: interaction stays at interactive frame rates on modest hardware.
@@ -69,7 +69,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect()
         self.view.rebuild_decorations(self.settings.domain, self.settings.units)
         self.load_demo()
-        self.panel.sync_bodies()
         self._install_shortcuts()
 
     # ------------------------------------------------------------------
@@ -80,15 +79,13 @@ class MainWindow(QtWidgets.QMainWindow):
         p.domainChanged.connect(self._on_domain)
         p.sceneEdited.connect(self._on_scene_edited)
         p.selectRequested.connect(self._on_select_from_table)
-        p.addRequested.connect(lambda: self.add_charge())
+        p.addObjectRequested.connect(self.add_object)
         p.deleteRequested.connect(self.delete_selected)
-        p.clearRequested.connect(self.clear_charges)
+        p.clearRequested.connect(self.clear_all)
         p.resetViewRequested.connect(self.reset_view)
         p.forceFitRequested.connect(self.fit_force_scale)
 
         p.toolChanged.connect(self._on_tool_changed)
-        p.addBodyRequested.connect(self.add_body)
-        p.deleteBodyRequested.connect(self.delete_selected)
         p.clearMeasureRequested.connect(self.clear_measurement)
         p.exampleRequested.connect(self.load_example)
 
@@ -98,7 +95,7 @@ class MainWindow(QtWidgets.QMainWindow):
         v.selectionChanged.connect(self._on_select_from_view)
         v.dragStarted.connect(self._on_drag_started)
         v.dragFinished.connect(self._on_drag_finished)
-        v.addRequested.connect(self.add_charge)
+        v.addRequested.connect(self._offer_object_menu)
 
         self.scene.subscribe(lambda _reason: self.request_redraw())
 
@@ -121,10 +118,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scene.charges.append(
                 PointCharge(q=q, position=np.array(pos),
                             radius=radius_for_charge(q, self.settings.domain)))
-        self.panel.sync_table()
+        self.panel.sync_objects()
         self.request_redraw()
 
-    def add_charge(self, position=None) -> None:
+    def add_object(self, name: str, position=None):
+        """Create any kind of object by name -- the one entry point.
+
+        Used by the object buttons, the double-click menu and the shortcut,
+        so there is a single place that knows how a new object is set up.
+        """
+        if name in (POINT, "Point charge"):
+            return self.add_charge(position)
+        return self.add_body(name, position)
+
+    def object_menu(self, position) -> QtWidgets.QMenu:
+        """The 'what do you want to put here' menu for a double-click."""
+        menu = QtWidgets.QMenu(self)
+        menu.setTitle("Add here")
+        for name in OBJECT_TYPES:
+            act = menu.addAction("Point charge" if name == POINT else name)
+            act.setData(name)
+        return menu
+
+    def _offer_object_menu(self, position, global_pt) -> None:
+        menu = self.object_menu(position)
+        chosen = menu.exec(global_pt)
+        if chosen is not None:
+            self.add_object(chosen.data(), position)
+
+    def add_charge(self, position=None):
         d = self.settings.domain
         if position is None:
             position = np.array([0.0, 0.0, 0.0])
@@ -136,10 +158,11 @@ class MainWindow(QtWidgets.QMainWindow):
                              radius=radius_for_charge(q, d))
         self.scene.add_charge(charge)
         self.view.set_selected(charge.uid)
-        self.panel.sync_table(charge.uid)
+        self.panel.sync_objects(charge.uid)
         self.request_redraw()
+        return charge
 
-    def add_body(self, name: str) -> None:
+    def add_body(self, name: str, position=None):
         d = self.settings.domain
         cls = BODY_TYPES[name]
         body = cls(position=np.zeros(3), n_sites=220)
@@ -148,15 +171,20 @@ class MainWindow(QtWidgets.QMainWindow):
             setattr(body, attr, getattr(body, attr) * d)
         if name in ("Line", "Loop"):
             body.wire_radius = 0.012 * d
-        # Offset so a second body of the same kind does not land on the first.
-        same = [b for b in self.scene.bodies if b.kind == body.kind]
-        if same:
-            body.position = np.array([0.0, 0.0, (len(same) % 2 * 2 - 1)
-                                      * 0.35 * d])
+        if position is not None:
+            body.position = np.asarray(position, dtype=float)
+        else:
+            # Offset so a second body of the same kind does not land on the
+            # first.
+            same = [b for b in self.scene.bodies if b.kind == body.kind]
+            if same:
+                body.position = np.array([0.0, 0.0, (len(same) % 2 * 2 - 1)
+                                          * 0.35 * d])
         self.scene.add_body(body)
         self.view.set_selected(body.uid)
-        self.panel.sync_bodies(body.uid)
+        self.panel.sync_objects(body.uid)
         self.request_redraw()
+        return body
 
     def load_example(self, name: str) -> None:
         """Preset scenes, so each feature has somewhere obvious to start."""
@@ -190,8 +218,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     q=q, position=np.array([x, 0.0, 0.0]),
                     radius=radius_for_charge(q, d)))
         self.scene.notify("example")
-        self.panel.sync_table()
-        self.panel.sync_bodies()
+        self.panel.sync_objects()
         self.request_redraw()
 
     def delete_selected(self) -> None:
@@ -204,16 +231,14 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.scene.remove_charge(uid)
         self.view.set_selected(None)
-        self.panel.sync_table()
-        self.panel.sync_bodies()
+        self.panel.sync_objects()
         self.request_redraw()
 
-    def clear_charges(self) -> None:
+    def clear_all(self) -> None:
         self.scene.clear()
         self.view.set_selected(None)
         self.clear_measurement()
-        self.panel.sync_table()
-        self.panel.sync_bodies()
+        self.panel.sync_objects()
         self.request_redraw()
 
     def fit_force_scale(self) -> None:
@@ -256,7 +281,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                         "body, not on a point charge.", 4000)
                 return
             self.scene.deposit_charge(uid, self.panel.deposit_amount())
-            self.panel.sync_bodies(self.view.selected_uid)
+            self.panel.sync_objects(self.view.selected_uid)
             self._relax.start()
         elif tool == "measure":
             body = self.scene.body(uid)
@@ -315,17 +340,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_charge_moved(self, uid: int) -> None:
         self.scene.invalidate()
-        if self.scene.body(uid) is not None:
-            self.panel.sync_bodies(uid)
-        else:
-            self.panel.sync_table(uid)
+        self.panel.sync_objects(uid)
         self.panel.update_readout(uid)
         self.request_redraw()
 
     def _on_select_from_view(self, uid) -> None:
         self.settings.selected_uid = uid
-        self.panel.select_uid(uid)
-        self.panel.select_body(uid)
+        self.panel.select_object(uid)
         self.panel.show_body_editor(uid)
         self.panel.update_readout(uid)
         self.request_redraw()

@@ -9,10 +9,16 @@ from ..core.bodies import BODY_TYPES, Material
 from ..core.entities import radius_for_charge
 from ..units import UNIT_SYSTEMS, Quantity, UnitSystem
 from ..viz import colormaps as cmaps
-from ..viz.layers import RenderSettings, force_gain_for
+from ..viz.layers import (CONDUCTOR_RGB, INSULATOR_RGB,
+                          RenderSettings, force_gain_for)
 
-COL_LABEL, COL_Q, COL_X, COL_Y, COL_Z = range(5)
-BCOL_LABEL, BCOL_KIND, BCOL_MAT, BCOL_Q = range(4)
+OCOL_NAME, OCOL_TYPE, OCOL_Q, OCOL_X, OCOL_Y, OCOL_Z = range(6)
+
+#: Everything that can be placed, in the order the buttons and the
+#: double-click menu offer it.  "Point" is a bare point charge; the rest are
+#: bodies from :data:`emsim.core.bodies.BODY_TYPES`.
+POINT = "Point"
+OBJECT_TYPES = (POINT, *BODY_TYPES)
 
 TOOLS = (("select", "Select", "Click to select, drag to move."),
          ("charge", "Add charge", "Click a body to deposit the charge below "
@@ -60,14 +66,12 @@ class ControlPanel(QtWidgets.QWidget):
     domainChanged = QtCore.pyqtSignal()
     sceneEdited = QtCore.pyqtSignal()
     selectRequested = QtCore.pyqtSignal(object)
-    addRequested = QtCore.pyqtSignal()
     deleteRequested = QtCore.pyqtSignal()
     clearRequested = QtCore.pyqtSignal()
     resetViewRequested = QtCore.pyqtSignal()
     forceFitRequested = QtCore.pyqtSignal()
     toolChanged = QtCore.pyqtSignal(str)
-    addBodyRequested = QtCore.pyqtSignal(str)
-    deleteBodyRequested = QtCore.pyqtSignal()
+    addObjectRequested = QtCore.pyqtSignal(str)
     clearMeasureRequested = QtCore.pyqtSignal()
     exampleRequested = QtCore.pyqtSignal(str)
 
@@ -92,12 +96,11 @@ class ControlPanel(QtWidgets.QWidget):
 
         self._build_units()
         self._build_tools()
-        self._build_bodies()
+        self._build_objects()
         self._build_measure()
         self._build_force()
         self._build_efield()
         self._build_potential()
-        self._build_charges()
         self._build_readout()
         self.v.addStretch(1)
 
@@ -170,32 +173,49 @@ class ControlPanel(QtWidgets.QWidget):
         lay.addWidget(self.tool_hint)
         self.v.addWidget(box)
 
-    def _build_bodies(self) -> None:
-        box, lay = _group("Bodies")
+    def _build_objects(self) -> None:
+        """One list for everything in the scene.
+
+        Point charges and bodies used to live in two tables in different parts
+        of the panel, which meant scrolling between them to compare or select.
+        They are one kind of thing to the user -- something in the scene with a
+        charge and a position -- so they get one list.
+        """
+        box, lay = _group("Objects")
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(3)
-        for name in BODY_TYPES:
+        for name in OBJECT_TYPES:
             b = QtWidgets.QPushButton(name)
             b.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                             QtWidgets.QSizePolicy.Policy.Fixed)
-            b.clicked.connect(lambda _c, n=name: self.addBodyRequested.emit(n))
+            b.setToolTip(f"Add a {name.lower()}"
+                         + ("" if name == POINT else " (conductor by default)"))
+            b.clicked.connect(
+                lambda _c, n=name: self.addObjectRequested.emit(n))
             row.addWidget(b)
         lay.addLayout(row)
 
-        self.btable = QtWidgets.QTableWidget(0, 4)
-        self.btable.verticalHeader().setVisible(False)
-        self.btable.setSelectionBehavior(
+        self.table = QtWidgets.QTableWidget(0, 6)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.btable.setSelectionMode(
+        self.table.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.btable.setMinimumHeight(110)
-        hh = self.btable.horizontalHeader()
+        self.table.setMinimumHeight(170)
+        hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.btable.itemChanged.connect(self._on_body_table_edit)
-        self.btable.itemSelectionChanged.connect(self._on_body_table_select)
-        lay.addWidget(self.btable)
+        hh.setSectionResizeMode(OCOL_NAME,
+                                QtWidgets.QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(OCOL_TYPE,
+                                QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(OCOL_NAME, 46)
+        self.table.setColumnWidth(OCOL_TYPE, 74)
+        hh.setMinimumSectionSize(40)
+        self.table.itemChanged.connect(self._on_table_edit)
+        self.table.itemSelectionChanged.connect(self._on_table_select)
+        lay.addWidget(self.table)
 
-        # -- editor for the selected body
+        # -- extra fields that only a body has
         self.mat_combo = QtWidgets.QComboBox()
         self.mat_combo.addItems(["Conductor", "Insulator"])
         self.mat_combo.currentIndexChanged.connect(self._on_body_edit)
@@ -234,9 +254,12 @@ class ControlPanel(QtWidgets.QWidget):
             lay.addWidget(r)
 
         btns = QtWidgets.QHBoxLayout()
-        self.del_body_btn = QtWidgets.QPushButton("Delete body")
-        self.del_body_btn.clicked.connect(self.deleteBodyRequested.emit)
-        btns.addWidget(self.del_body_btn)
+        self.del_btn = QtWidgets.QPushButton("Delete")
+        self.del_btn.clicked.connect(self.deleteRequested.emit)
+        btns.addWidget(self.del_btn)
+        clear = QtWidgets.QPushButton("Clear")
+        clear.clicked.connect(self.clearRequested.emit)
+        btns.addWidget(clear)
         self.example_combo = QtWidgets.QComboBox()
         self.example_combo.addItems(["Examples…", "Parallel plates",
                                      "Sphere + point charge",
@@ -244,6 +267,13 @@ class ControlPanel(QtWidgets.QWidget):
         self.example_combo.activated.connect(self._on_example)
         btns.addWidget(self.example_combo)
         lay.addLayout(btns)
+
+        hint = QtWidgets.QLabel(
+            "Drag an object to move it · Shift-drag for z · double-click "
+            "empty space to choose what to add · Del to remove")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8a93a6; font-size: 10px;")
+        lay.addWidget(hint)
         self.v.addWidget(box)
 
     def _build_measure(self) -> None:
@@ -423,42 +453,6 @@ class ControlPanel(QtWidgets.QWidget):
             lay.addWidget(r)
         self.v.addWidget(box)
 
-    def _build_charges(self) -> None:
-        box, lay = _group("Charges")
-        self.table = QtWidgets.QTableWidget(0, 5)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(
-            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setMinimumHeight(150)
-        hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(COL_LABEL,
-                                QtWidgets.QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(COL_LABEL, 34)
-        hh.setMinimumSectionSize(34)
-        self.table.itemChanged.connect(self._on_table_edit)
-        self.table.itemSelectionChanged.connect(self._on_table_select)
-        lay.addWidget(self.table)
-
-        btns = QtWidgets.QHBoxLayout()
-        for text, sig in (("Add", self.addRequested),
-                          ("Delete", self.deleteRequested),
-                          ("Clear", self.clearRequested)):
-            b = QtWidgets.QPushButton(text)
-            b.clicked.connect(sig.emit)
-            btns.addWidget(b)
-        lay.addLayout(btns)
-
-        hint = QtWidgets.QLabel(
-            "Drag a charge to move it in the view plane · Shift-drag for z · "
-            "double-click empty space to add · Del to remove")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #8a93a6; font-size: 10px;")
-        lay.addWidget(hint)
-        self.v.addWidget(box)
-
     def _build_readout(self) -> None:
         box, lay = _group("Selected charge")
         self.readout = QtWidgets.QLabel("—")
@@ -554,63 +548,87 @@ class ControlPanel(QtWidgets.QWidget):
             self.exampleRequested.emit(self.example_combo.itemText(index))
         self.example_combo.setCurrentIndex(0)
 
-    # -- bodies ------------------------------------------------------------
-    def selected_body_uid(self) -> int | None:
-        rows = self.btable.selectionModel().selectedRows()
-        if not rows:
-            return None
-        it = self.btable.item(rows[0].row(), BCOL_LABEL)
-        return it.data(QtCore.Qt.ItemDataRole.UserRole) if it else None
+    # -- the object list ---------------------------------------------------
+    @staticmethod
+    def type_label(obj) -> str:
+        if not hasattr(obj, "material"):
+            return POINT
+        return f"{obj.kind.title()} · {'C' if obj.is_conductor else 'I'}"
 
-    def sync_bodies(self, keep_uid: int | None = None) -> None:
+    @staticmethod
+    def type_color(obj) -> QtGui.QColor:
+        """Match the colour the object is drawn in, so the list reads like it."""
+        if not hasattr(obj, "material"):
+            return QtGui.QColor("#9aa4b8")
+        rgb = CONDUCTOR_RGB if obj.is_conductor else INSULATOR_RGB
+        return QtGui.QColor.fromRgbF(*[min(1.0, c * 1.25) for c in rgb])
+
+    def sync_objects(self, keep_uid: int | None = None) -> None:
         if keep_uid is None:
-            keep_uid = self.selected_body_uid()
+            keep_uid = self.selected_uid()
         self._syncing = True
         u = self.units
-        self.btable.setHorizontalHeaderLabels(
-            ["", "Type", "Material", f"Q ({u.entry_symbol(Quantity.CHARGE)})"])
-        self.btable.setRowCount(len(self.scene.bodies))
-        for r, b in enumerate(self.scene.bodies):
-            vals = [b.label, b.kind.title(),
-                    "Conductor" if b.is_conductor else "Insulator",
-                    f"{u.to_entry(b.charge, Quantity.CHARGE):.4g}"]
+        qs, ls = (u.entry_symbol(Quantity.CHARGE),
+                  u.entry_symbol(Quantity.LENGTH))
+        self.table.setHorizontalHeaderLabels(
+            ["", "Type", f"Q ({qs})", f"x ({ls})", f"y ({ls})", f"z ({ls})"])
+
+        objects = self.scene.objects()
+        self.table.setRowCount(len(objects))
+        for r, o in enumerate(objects):
+            q = o.charge if hasattr(o, "material") else o.q
+            vals = [o.label, self.type_label(o),
+                    f"{u.to_entry(q, Quantity.CHARGE):.4g}",
+                    *[f"{u.to_entry(x, Quantity.LENGTH):.4g}" for x in o.position]]
             for col, text in enumerate(vals):
-                item = self.btable.item(r, col)
+                item = self.table.item(r, col)
                 if item is None:
                     item = QtWidgets.QTableWidgetItem()
-                    if col != BCOL_Q:
+                    if col in (OCOL_NAME, OCOL_TYPE):
                         item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled
                                       | QtCore.Qt.ItemFlag.ItemIsSelectable)
-                    self.btable.setItem(r, col, item)
+                    self.table.setItem(r, col, item)
                 item.setText(text)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, b.uid)
-                if col == BCOL_Q:
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, o.uid)
+                if col == OCOL_TYPE:
+                    item.setForeground(self.type_color(o))
+                    item.setToolTip("point charge" if not hasattr(o, "material")
+                                    else ("conductor" if o.is_conductor
+                                          else "insulator"))
+                elif col == OCOL_Q:
                     item.setForeground(QtGui.QColor(
-                        "#f0594f" if b.charge > 0 else
-                        "#4f8ef0" if b.charge < 0 else "#bbb"))
+                        "#f0594f" if q > 0 else "#4f8ef0" if q < 0 else "#bbb"))
         self._syncing = False
         if keep_uid is not None:
-            self.select_body(keep_uid)
+            self.select_object(keep_uid)
         self.show_body_editor(keep_uid)
 
-    def select_body(self, uid: int | None) -> None:
+    def selected_uid(self) -> int | None:
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        it = self.table.item(rows[0].row(), OCOL_NAME)
+        return it.data(QtCore.Qt.ItemDataRole.UserRole) if it else None
+
+    def select_object(self, uid: int | None) -> None:
+        """Select a row without emitting :attr:`selectRequested` back out."""
         prev = self._syncing
         self._syncing = True
-        self.btable.clearSelection()
+        self.table.clearSelection()
         if uid is not None:
-            for r in range(self.btable.rowCount()):
-                it = self.btable.item(r, BCOL_LABEL)
+            for r in range(self.table.rowCount()):
+                it = self.table.item(r, OCOL_NAME)
                 if it is not None and it.data(QtCore.Qt.ItemDataRole.UserRole) == uid:
-                    self.btable.selectRow(r)
+                    self.table.selectRow(r)
                     break
         self._syncing = prev
 
     def show_body_editor(self, uid: int | None) -> None:
-        """Retarget the size fields at whichever body is selected."""
+        """Reveal the body-only fields, aimed at whichever object is selected."""
         body = self.scene.body(uid) if uid is not None else None
         for r in self.body_rows:
             r.setVisible(body is not None)
-        self.del_body_btn.setEnabled(body is not None)
+        self.del_btn.setEnabled(uid is not None)
         if body is None:
             return
         self._syncing = True
@@ -630,38 +648,41 @@ class ControlPanel(QtWidgets.QWidget):
                 row.setVisible(False)
         self._syncing = False
 
-    def _on_body_table_select(self) -> None:
+    def _on_table_select(self) -> None:
         if self._syncing:
             return
-        rows = self.btable.selectionModel().selectedRows()
-        uid = None
-        if rows:
-            it = self.btable.item(rows[0].row(), BCOL_LABEL)
-            uid = it.data(QtCore.Qt.ItemDataRole.UserRole) if it else None
-        self.selectRequested.emit(uid)
+        self.selectRequested.emit(self.selected_uid())
 
-    def _on_body_table_edit(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if self._syncing or item.column() != BCOL_Q:
+    def _on_table_edit(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._syncing:
             return
-        body = self.scene.body(item.data(QtCore.Qt.ItemDataRole.UserRole))
-        if body is None:
+        uid = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        obj = self.scene.by_uid(uid)
+        if obj is None:
             return
         try:
-            body.charge = self.units.from_entry(float(item.text()),
-                                                Quantity.CHARGE)
+            value = float(item.text())
         except ValueError:
-            pass
+            self.sync_objects(uid)
+            return
+        col = item.column()
+        if col == OCOL_Q:
+            q = self.units.from_entry(value, Quantity.CHARGE)
+            if hasattr(obj, "material"):
+                obj.charge = q
+            else:
+                obj.q = q
+                obj.radius = radius_for_charge(q, self.st.domain)
+        elif col in (OCOL_X, OCOL_Y, OCOL_Z):
+            obj.position[col - OCOL_X] = self.units.from_entry(
+                value, Quantity.LENGTH)
         self.scene.invalidate()
         self.sceneEdited.emit()
 
     def _on_body_edit(self, *_a) -> None:
         if self._syncing:
             return
-        rows = self.btable.selectionModel().selectedRows()
-        if not rows:
-            return
-        it = self.btable.item(rows[0].row(), BCOL_LABEL)
-        body = self.scene.body(it.data(QtCore.Qt.ItemDataRole.UserRole))
+        body = self.scene.body(self.selected_uid())
         if body is None:
             return
         body.material = (Material.CONDUCTOR if self.mat_combo.currentIndex() == 0
@@ -772,9 +793,6 @@ class ControlPanel(QtWidgets.QWidget):
         self._syncing = True
         u = self.units
         qs, ls = u.entry_symbol(Quantity.CHARGE), u.entry_symbol(Quantity.LENGTH)
-        self.table.setHorizontalHeaderLabels(
-            ["", f"q ({qs})", f"x ({ls})", f"y ({ls})", f"z ({ls})"])
-
         self.domain_row.layout().itemAt(0).widget().setText(f"Half-width ({ls})")
         self.domain_spin.setValue(u.to_entry(self.st.domain, Quantity.LENGTH))
         self.domain_spin.setSingleStep(
@@ -782,79 +800,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.deposit.setSuffix(f"  {qs}")
         self._syncing = False
         self._update_slice_label()
-        self.sync_table()
-        self.sync_bodies()
-
-    # -- charge table ------------------------------------------------------
-    def sync_table(self, keep_uid: int | None = None) -> None:
-        self._syncing = True
-        u = self.units
-        self.table.setRowCount(len(self.scene.charges))
-        for r, c in enumerate(self.scene.charges):
-            vals = [c.label,
-                    f"{u.to_entry(c.q, Quantity.CHARGE):.4g}",
-                    *[f"{u.to_entry(x, Quantity.LENGTH):.4g}" for x in c.position]]
-            for col, text in enumerate(vals):
-                item = self.table.item(r, col)
-                if item is None:
-                    item = QtWidgets.QTableWidgetItem()
-                    if col == COL_LABEL:
-                        item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled
-                                      | QtCore.Qt.ItemFlag.ItemIsSelectable)
-                    self.table.setItem(r, col, item)
-                item.setText(text)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, c.uid)
-                if col == COL_Q:
-                    item.setForeground(QtGui.QColor(
-                        "#f0594f" if c.q > 0 else "#4f8ef0" if c.q < 0 else "#bbb"))
-        if keep_uid is not None:
-            self.select_uid(keep_uid)
-        self._syncing = False
-
-    def select_uid(self, uid: int | None) -> None:
-        """Select a row without emitting :attr:`selectRequested` back out."""
-        prev = self._syncing
-        self._syncing = True
-        self.table.clearSelection()
-        if uid is not None:
-            for r in range(self.table.rowCount()):
-                it = self.table.item(r, COL_LABEL)
-                if it is not None and it.data(QtCore.Qt.ItemDataRole.UserRole) == uid:
-                    self.table.selectRow(r)
-                    break
-        self._syncing = prev
-
-    def _on_table_select(self) -> None:
-        if self._syncing:
-            return
-        rows = self.table.selectionModel().selectedRows()
-        uid = None
-        if rows:
-            it = self.table.item(rows[0].row(), COL_LABEL)
-            uid = it.data(QtCore.Qt.ItemDataRole.UserRole) if it else None
-        self.selectRequested.emit(uid)
-
-    def _on_table_edit(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if self._syncing:
-            return
-        uid = item.data(QtCore.Qt.ItemDataRole.UserRole)
-        charge = self.scene.by_uid(uid)
-        if charge is None:
-            return
-        try:
-            value = float(item.text())
-        except ValueError:
-            self.sync_table(uid)
-            return
-        col = item.column()
-        if col == COL_Q:
-            charge.q = self.units.from_entry(value, Quantity.CHARGE)
-            charge.radius = radius_for_charge(charge.q, self.st.domain)
-        elif col in (COL_X, COL_Y, COL_Z):
-            charge.position[col - COL_X] = self.units.from_entry(
-                value, Quantity.LENGTH)
-        self.scene.invalidate()
-        self.sceneEdited.emit()
+        self.sync_objects()
 
     # -- readout -----------------------------------------------------------
     def update_readout(self, uid: int | None) -> None:
